@@ -5,25 +5,36 @@
 #include <cstdlib>
 #include <string>
 #include <map>
+#include <vector>
+#include <algorithm>
+#include <filesystem>
 #include "drawingcanvas.h"
 #include "touchhandler.h"
 
+namespace fs = std::filesystem;
+
 // Colors
-const Uint32 COLOR_WHITE = SDL_MapRGB(SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888), 255, 255, 255);
-const Uint32 COLOR_BLACK = SDL_MapRGB(SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888), 0, 0, 0);
-const Uint32 COLOR_RED   = SDL_MapRGB(SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888), 255, 59, 48);
-const Uint32 COLOR_GREEN = SDL_MapRGB(SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888), 40, 205, 65);
-const Uint32 COLOR_BLUE  = SDL_MapRGB(SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888), 0, 122, 255);
-const Uint32 COLOR_YELLOW= SDL_MapRGB(SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888), 255, 204, 0);
-const Uint32 COLOR_PURPLE= SDL_MapRGB(SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888), 175, 82, 222);
-const Uint32 COLOR_ORANGE= SDL_MapRGB(SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888), 255, 149, 0);
-const Uint32 COLOR_PINK  = SDL_MapRGB(SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888), 255, 45, 85);
-const Uint32 COLOR_CYAN  = SDL_MapRGB(SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888), 90, 200, 250);
-const Uint32 COLOR_LIGHT_GRAY = SDL_MapRGB(SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888), 229, 229, 234);
-const Uint32 COLOR_DARK_GRAY  = SDL_MapRGB(SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888), 44, 44, 46);
-const Uint32 COLOR_TOOLBAR_BG = SDL_MapRGB(SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888), 240, 240, 245);
-const Uint32 COLOR_BORDER     = SDL_MapRGB(SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888), 180, 180, 185);
-const Uint32 COLOR_HIGHLIGHT  = SDL_MapRGB(SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888), 180, 200, 255);
+static void hoverHighlight(SDL_Renderer* r, SDL_Rect rect, SDL_Point touch);
+namespace {
+    SDL_PixelFormat* _fmt = SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888);
+    inline Uint32 _rgb(Uint8 r, Uint8 g, Uint8 b) { return SDL_MapRGB(_fmt, r, g, b); }
+}
+
+const Uint32 COLOR_WHITE      = _rgb(255, 255, 255);
+const Uint32 COLOR_BLACK      = _rgb(  0,   0,   0);
+const Uint32 COLOR_RED        = _rgb(255,  59,  48);
+const Uint32 COLOR_GREEN      = _rgb( 40, 205,  65);
+const Uint32 COLOR_BLUE       = _rgb(  0, 122, 255);
+const Uint32 COLOR_YELLOW     = _rgb(255, 204,   0);
+const Uint32 COLOR_PURPLE     = _rgb(175,  82, 222);
+const Uint32 COLOR_ORANGE     = _rgb(255, 149,   0);
+const Uint32 COLOR_PINK       = _rgb(255,  45,  85);
+const Uint32 COLOR_CYAN       = _rgb( 90, 200, 250);
+const Uint32 COLOR_LIGHT_GRAY = _rgb(229, 229, 234);
+const Uint32 COLOR_DARK_GRAY  = _rgb( 44,  44,  46);
+const Uint32 COLOR_TOOLBAR_BG = _rgb(240, 240, 245);
+const Uint32 COLOR_BORDER     = _rgb(180, 180, 185);
+const Uint32 COLOR_HIGHLIGHT  = _rgb(180, 200, 255);
 
 struct Button {
     SDL_Rect rect;
@@ -42,6 +53,7 @@ private:
     SDL_Window* window;
     SDL_Renderer* renderer;
     SDL_Texture* canvasTexture;
+    TTF_Font* fontTiny;
     TTF_Font* fontSmall;
     TTF_Font* fontMedium;
     TTF_Font* fontLarge;
@@ -53,6 +65,12 @@ private:
     std::vector<Button> toolbarButtons;
     int penSize = 5;
     bool fillArmed = false;
+
+    enum class ShapeMode { NONE, LINE, RECT, ELLIPSE };
+    ShapeMode shapeMode = ShapeMode::NONE;
+    SDL_Point shapeStart = {0, 0};
+    SDL_Point shapeCurrent = {0, 0};
+    bool shapeDragging = false;
 
     bool showOverlay = false;
     std::string overlayType;
@@ -72,14 +90,18 @@ private:
 
     int activeFinger = -1;
     SDL_Point activeFingerPos;
-
-    std::map<std::string, Uint32> lastClickTime;
-    const Uint32 doubleClickThreshold = 300;
+    SDL_Point lastTouchPos = {-1, -1};  // for hover highlight in overlay
 
     void createToolbar();
     void updateCanvasTexture();
     void drawToolbar();
     void drawOverlay();
+    void drawGhostShape();
+    void commitShape(int x1, int y1, int x2, int y2);
+    void drawVirtualKeyboard(int x, int y, int w);
+    bool handleVKTap(int tx, int ty, int panelX, int panelY, int panelW);
+
+    bool vkShift = false;
     void handleTouchDown(int fingerId, int x, int y);
     void handleTouchMove(int fingerId, int x, int y);
     void handleTouchUp(int fingerId);
@@ -119,9 +141,11 @@ PiPaint::PiPaint() : canvas(1920, 1080), touch(1920, 1080) {
                                width, height, SDL_WINDOW_FULLSCREEN_DESKTOP);
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
     canvasTexture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, width, height);
-    fontSmall = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20);
+    fontTiny   = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 13);
+    fontSmall  = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20);
     fontMedium = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 28);
-    fontLarge = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 40);
+    fontLarge  = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 40);
+    if (!fontTiny)  fontTiny  = TTF_OpenFont("DejaVuSans.ttf", 13);
     if (!fontSmall) fontSmall = TTF_OpenFont("DejaVuSans.ttf", 20);
 
     touch.init();
@@ -134,6 +158,7 @@ PiPaint::PiPaint() : canvas(1920, 1080), touch(1920, 1080) {
 }
 
 PiPaint::~PiPaint() {
+    TTF_CloseFont(fontTiny);
     TTF_CloseFont(fontSmall);
     TTF_CloseFont(fontMedium);
     TTF_CloseFont(fontLarge);
@@ -164,15 +189,18 @@ void PiPaint::createToolbar() {
     margin = 6;
     y = (toolbarHeight - btnH) / 2;
     struct { std::string label; std::string type; } textBtns[] = {
-        {"Eraser", "eraser"},
-        {"Fill", "fill"},
-        {"Bg", "bg"},
-        {"Undo", "undo"},
-        {"Redo", "redo"},
-        {"Clear", "clear"},
-        {"Save", "save"},
-        {"Load", "load"},
-        {"Exit", "exit"}
+        {"Eraser",   "eraser"},
+        {"Fill",     "fill"},
+        {"Bg",       "bg"},
+        {"Line",     "shape_line"},
+        {"Rect",     "shape_rect"},
+        {"Ellipse",  "shape_ellipse"},
+        {"Undo",     "undo"},
+        {"Redo",     "redo"},
+        {"Clear",    "clear"},
+        {"Save",     "save"},
+        {"Load",     "load"},
+        {"Exit",     "exit"}
     };
     for (auto& tb : textBtns) {
         Button btn;
@@ -236,13 +264,14 @@ void PiPaint::drawToolbar() {
             SDL_RenderDrawRect(renderer, &btn.rect);
             if (col == canvas.getCurrentColor() && !canvas.isEraserMode()) {
                 SDL_Rect highlight = {btn.rect.x-3, btn.rect.y-3, btn.rect.w+6, btn.rect.h+6};
-                SDL_SetRenderDrawColor(renderer, 0,122,255,255);
+                SDL_SetRenderDrawColor(renderer, 0, 122, 255, 255);
                 SDL_RenderDrawRect(renderer, &highlight);
             }
+            hoverHighlight(renderer, btn.rect, lastTouchPos);
         } else if (btn.type == "size_label") {
             char text[10];
             snprintf(text, sizeof(text), "%dpx", penSize);
-            SDL_Surface* surf = TTF_RenderUTF8_Blended(fontSmall, text, {44,44,46,0});
+            SDL_Surface* surf = TTF_RenderUTF8_Blended(fontTiny, text, {44,44,46,0});
             SDL_Texture* tex = SDL_CreateTextureFromSurface(renderer, surf);
             SDL_Rect dst = {btn.rect.x + (btn.rect.w - surf->w)/2,
                             btn.rect.y + (btn.rect.h - surf->h)/2,
@@ -259,6 +288,7 @@ void PiPaint::drawToolbar() {
                                btn.rect.x+btn.rect.w/2, btn.rect.y+btn.rect.h-10);
             SDL_RenderDrawLine(renderer, btn.rect.x+10, btn.rect.y+btn.rect.h/2,
                                btn.rect.x+btn.rect.w-10, btn.rect.y+btn.rect.h/2);
+            hoverHighlight(renderer, btn.rect, lastTouchPos);
         } else if (btn.type == "size_down") {
             SDL_SetRenderDrawColor(renderer, 200,200,200,255);
             SDL_RenderFillRect(renderer, &btn.rect);
@@ -266,6 +296,7 @@ void PiPaint::drawToolbar() {
             SDL_RenderDrawRect(renderer, &btn.rect);
             SDL_RenderDrawLine(renderer, btn.rect.x+10, btn.rect.y+btn.rect.h/2,
                                btn.rect.x+btn.rect.w-10, btn.rect.y+btn.rect.h/2);
+            hoverHighlight(renderer, btn.rect, lastTouchPos);
         } else {
             const char* label = "";
             if (btn.type == "eraser") label = "Eraser";
@@ -275,18 +306,25 @@ void PiPaint::drawToolbar() {
             else if (btn.type == "redo") label = "Redo";
             else if (btn.type == "clear") label = "Clear";
             else if (btn.type == "save") label = "Save";
-            else if (btn.type == "load") label = "Load";
-            else if (btn.type == "exit") label = "Exit";
+            else if (btn.type == "load")          label = "Load";
+            else if (btn.type == "shape_line")    label = "Line";
+            else if (btn.type == "shape_rect")    label = "Rect";
+            else if (btn.type == "shape_ellipse") label = "Ellipse";
+            else if (btn.type == "exit")          label = "Exit";
 
             Uint32 bg = COLOR_LIGHT_GRAY;
-            if (btn.type == "eraser" && canvas.isEraserMode()) bg = SDL_MapRGB(SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888), 200,220,255);
-            if (btn.type == "fill" && fillArmed) bg = SDL_MapRGB(SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888), 200,255,200);
+            if (btn.type == "eraser" && canvas.isEraserMode()) bg = _rgb(200, 220, 255);
+            if (btn.type == "fill"   && fillArmed)             bg = _rgb(200, 255, 200);
+            if (btn.type == "shape_line"    && shapeMode == ShapeMode::LINE)    bg = _rgb(220, 200, 255);
+            if (btn.type == "shape_rect"    && shapeMode == ShapeMode::RECT)    bg = _rgb(220, 200, 255);
+            if (btn.type == "shape_ellipse" && shapeMode == ShapeMode::ELLIPSE) bg = _rgb(220, 200, 255);
             SDL_SetRenderDrawColor(renderer, (bg>>16)&0xFF, (bg>>8)&0xFF, bg&0xFF, 255);
             SDL_RenderFillRect(renderer, &btn.rect);
-            SDL_SetRenderDrawColor(renderer, 44,44,46,255);
+            SDL_SetRenderDrawColor(renderer, 44, 44, 46, 255);
             SDL_RenderDrawRect(renderer, &btn.rect);
+            hoverHighlight(renderer, btn.rect, lastTouchPos);
 
-            SDL_Surface* surf = TTF_RenderUTF8_Blended(fontSmall, label, {44,44,46,0});
+            SDL_Surface* surf = TTF_RenderUTF8_Blended(fontTiny, label, {44,44,46,0});
             SDL_Texture* tex = SDL_CreateTextureFromSurface(renderer, surf);
             SDL_Rect dst = {btn.rect.x + (btn.rect.w - surf->w)/2,
                             btn.rect.y + (btn.rect.h - surf->h)/2,
@@ -298,34 +336,133 @@ void PiPaint::drawToolbar() {
     }
 }
 
-void PiPaint::drawOverlay() {
-    // Placeholder – implement later
-}
+// drawOverlay() implemented below with the other overlay methods
 
 void PiPaint::handleTouchDown(int fingerId, int x, int y) {
-    std::cout << "handleTouchDown: finger=" << fingerId << " (" << x << "," << y << ")\n";
+
+    // --- overlay intercepts all touches ---
+    if (showOverlay) {
+        bool isSave = (overlayType == "save");
+        int panelW = 720, panelH = isSave ? 860 : 560;
+        // clamp height so it never overflows screen
+        if (panelH > height - 40) panelH = height - 40;
+        int panelX = (width  - panelW) / 2;
+        int panelY = (height - panelH) / 2;
+        int sbW = 40, listW = panelW - 48 - sbW;
+        int py = panelY + 18 + 52 + 26; // after title + path
+
+        if (browsingFolder) {
+            py += 38; // "Choose folder" label
+            int listH = 220, rowH = 44;
+            int visItems = listH / rowH;
+
+            // Scrollbar arrows
+            int sbX = panelX+16+listW+4;
+            if (x >= sbX && x < sbX+36) {
+                if (y >= py && y < py+36) { if (browseScroll>0) browseScroll--; return; }
+                if (y >= py+listH-36 && y < py+listH) {
+                    if (browseScroll<(int)subdirs.size()-visItems) browseScroll++;
+                    return;
+                }
+            }
+            // List rows
+            if (x >= panelX+16 && x < panelX+16+listW && y >= py && y < py+listH) {
+                int idx = (y-py)/rowH + browseScroll;
+                if (idx>=0 && idx<(int)subdirs.size()) {
+                    if (selectedSubdir==idx) {
+                        currentBrowsePath += "/" + subdirs[idx];
+                        refreshSubdirs(); refreshFileList(); selectedSubdir=-1;
+                    } else selectedSubdir=idx;
+                }
+                return;
+            }
+            // Buttons
+            int by = py+listH+14;
+            struct { const char* action; int bw; } fbBtns[]=
+                {{"up",95},{"home",95},{"media",95},{"select",120},{"cancel",95}};
+            int bx=panelX+16;
+            for (auto& b : fbBtns) {
+                if (x>=bx && x<=bx+b.bw && y>=by && y<=by+40) {
+                    std::string a=b.action;
+                    if (a=="up") goUp();
+                    else if (a=="home") goHome();
+                    else if (a=="media") goMedia();
+                    else if (a=="select") selectCurrentFolder();
+                    else showOverlay=false;
+                    return;
+                }
+                bx+=b.bw+8;
+            }
+            return;
+        }
+
+        // File list
+        int listH=180, rowH=44, listY=py;
+        int visItems=listH/rowH;
+
+        // Scrollbar arrows
+        int sbX=panelX+16+listW+4;
+        if (x>=sbX && x<sbX+36) {
+            if (y>=listY && y<listY+36) { if (overlayScroll>0) overlayScroll--; return; }
+            if (y>=listY+listH-36 && y<listY+listH) {
+                if (overlayScroll<(int)overlayFiles.size()-visItems) overlayScroll++;
+                return;
+            }
+        }
+        // List rows
+        if (x>=panelX+16 && x<panelX+16+listW && y>=listY && y<listY+listH) {
+            int idx=(y-listY)/rowH+overlayScroll;
+            if (idx>=0 && idx<(int)overlayFiles.size()) {
+                if (selectedIndex==idx && overlayType=="load") loadSelectedDrawing();
+                else { selectedIndex=idx; if (isSave) filenameInput=overlayFiles[idx]; }
+            }
+            return;
+        }
+
+        py = listY+listH+14;
+
+        if (isSave) {
+            // Filename input box
+            int inputY=py+24;
+            if (x>=panelX+16 && x<=panelX+panelW-16 && y>=inputY && y<=inputY+44) {
+                cursorPos=(int)filenameInput.size(); return;
+            }
+            py=inputY+54;
+
+            // Virtual keyboard
+            int kbX=panelX+8, kbY=py, kbW=panelW-16;
+            if (handleVKTap(x, y, kbX, kbY, kbW)) return;
+            py+=5*(48+4)+14;
+        }
+
+        // Action buttons
+        struct { const char* action; int bw; } aBtns[]=
+            {{"browse",130},{isSave?"save":"load",120},{"cancel",100}};
+        int bx=panelX+16;
+        for (auto& b : aBtns) {
+            if (x>=bx && x<=bx+b.bw && y>=py && y<=py+42) {
+                std::string a=b.action;
+                if (a=="browse") enterFolderBrowser();
+                else if (a=="save") saveCurrentDrawing();
+                else if (a=="load") loadSelectedDrawing();
+                else showOverlay=false;
+                return;
+            }
+            bx+=b.bw+10;
+        }
+        return;  // consume all taps while overlay is open
+    }
+
     if (activeFinger != -1 && fingerId != activeFinger) {
-        std::cout << "  Ignoring, activeFinger=" << activeFinger << "\n";
         return;
     }
 
     for (auto& btn : toolbarButtons) {
-        if (x >= btn.rect.x && x <= btn.rect.x+btn.rect.w && y >= btn.rect.y && y <= btn.rect.y+btn.rect.h) {
-            if (btn.type == "color") {
-                executeToolAction("color", btn.index);
-            } else if (btn.type == "eraser" || btn.type == "fill" || btn.type == "bg") {
-                Uint32 now = SDL_GetTicks();
-                if (lastClickTime.count(btn.type) && (now - lastClickTime[btn.type]) < doubleClickThreshold) {
-                    executeToolAction(btn.type);
-                    lastClickTime.erase(btn.type);
-                } else {
-                    lastClickTime[btn.type] = now;
-                }
-            } else if (btn.type == "size_up" || btn.type == "size_down") {
-                executeToolAction(btn.type);
-            } else {
-                executeToolAction(btn.type);
-            }
+        if (x >= btn.rect.x && x <= btn.rect.x+btn.rect.w &&
+            y >= btn.rect.y && y <= btn.rect.y+btn.rect.h) {
+
+            // All buttons fire immediately on single tap
+            executeToolAction(btn.type, btn.index);
             return;
         }
     }
@@ -334,6 +471,12 @@ void PiPaint::handleTouchDown(int fingerId, int x, int y) {
         if (fillArmed) {
             canvas.floodFill(x, y);
             fillArmed = false;
+        } else if (shapeMode != ShapeMode::NONE) {
+            // Start shape drag
+            activeFinger = fingerId;
+            shapeStart   = {x, y};
+            shapeCurrent = {x, y};
+            shapeDragging = true;
         } else {
             activeFinger = fingerId;
             activeFingerPos = {x, y};
@@ -343,18 +486,25 @@ void PiPaint::handleTouchDown(int fingerId, int x, int y) {
 }
 
 void PiPaint::handleTouchMove(int fingerId, int x, int y) {
-    if (fingerId == activeFinger && y > toolbarHeight) {
+    lastTouchPos = {x, y};  // always track for hover feedback
+    if (fingerId != activeFinger || y <= toolbarHeight) return;
+    if (shapeDragging) {
+        shapeCurrent = {x, y};  // ghost redrawn in run loop
+    } else {
         canvas.continueStroke(x, y, fingerId);
         activeFingerPos = {x, y};
     }
 }
 
 void PiPaint::handleTouchUp(int fingerId) {
-    std::cout << "handleTouchUp: finger=" << fingerId << "\n";
-    if (fingerId == activeFinger) {
+    if (fingerId != activeFinger) return;
+    if (shapeDragging) {
+        commitShape(shapeStart.x, shapeStart.y, shapeCurrent.x, shapeCurrent.y);
+        shapeDragging = false;
+    } else {
         canvas.endStroke(fingerId);
-        activeFinger = -1;
     }
+    activeFinger = -1;
 }
 
 void PiPaint::handleMouseButtonDown(SDL_MouseButtonEvent& ev) {
@@ -362,21 +512,83 @@ void PiPaint::handleMouseButtonDown(SDL_MouseButtonEvent& ev) {
 }
 
 void PiPaint::handleMouseMotion(SDL_MouseMotionEvent& ev) {
-    if (activeFinger == 0 && ev.y > toolbarHeight) {
+    lastTouchPos = {ev.x, ev.y};
+    if (activeFinger != 0 || ev.y <= toolbarHeight) return;
+    if (shapeDragging) {
+        shapeCurrent = {ev.x, ev.y};
+    } else {
         canvas.continueStroke(ev.x, ev.y, 0);
         activeFingerPos = {ev.x, ev.y};
     }
 }
 
 void PiPaint::handleMouseButtonUp(SDL_MouseButtonEvent& ev) {
-    if (activeFinger == 0) {
-        canvas.endStroke(0);
-        activeFinger = -1;
-    }
+    handleTouchUp(0);
 }
 
 void PiPaint::handleKeyboard(SDL_KeyboardEvent& ev) {
     if (ev.type == SDL_KEYDOWN) {
+        // Overlay keyboard handling
+        if (showOverlay && overlayType == "save" && !browsingFolder) {
+            if (ev.keysym.sym == SDL_SCANCODE_TO_KEYCODE(SDL_SCANCODE_RETURN) ||
+                ev.keysym.sym == SDLK_KP_ENTER) {
+                saveCurrentDrawing();
+                return;
+            }
+            if (ev.keysym.sym == SDLK_ESCAPE) { showOverlay = false; return; }
+            if (ev.keysym.sym == SDLK_BACKSPACE && cursorPos > 0) {
+                filenameInput.erase(cursorPos-1, 1);
+                cursorPos--;
+                cursorVisible = true; cursorTimer = SDL_GetTicks();
+                return;
+            }
+            if (ev.keysym.sym == SDLK_DELETE && cursorPos < (int)filenameInput.size()) {
+                filenameInput.erase(cursorPos, 1);
+                cursorVisible = true; cursorTimer = SDL_GetTicks();
+                return;
+            }
+            if (ev.keysym.sym == SDLK_LEFT  && cursorPos > 0) { cursorPos--; return; }
+            if (ev.keysym.sym == SDLK_RIGHT && cursorPos < (int)filenameInput.size()) { cursorPos++; return; }
+            if (ev.keysym.sym == SDLK_HOME) { cursorPos = 0; return; }
+            if (ev.keysym.sym == SDLK_END)  { cursorPos = (int)filenameInput.size(); return; }
+            // Printable characters
+            SDL_Keycode k = ev.keysym.sym;
+            bool shift = (ev.keysym.mod & KMOD_SHIFT) != 0;
+            char c = 0;
+            if (k >= SDLK_a && k <= SDLK_z) c = shift ? ('A' + k - SDLK_a) : ('a' + k - SDLK_a);
+            else if (k >= SDLK_0 && k <= SDLK_9) {
+                const char* nums   = "0123456789";
+                const char* shNums = ")!@#$%^&*(";
+                c = shift ? shNums[k - SDLK_0] : nums[k - SDLK_0];
+            }
+            else if (k == SDLK_SPACE)      c = ' ';
+            else if (k == SDLK_MINUS)      c = shift ? '_' : '-';
+            else if (k == SDLK_PERIOD)     c = '.';
+            else if (k == SDLK_UNDERSCORE) c = '_';
+            if (c && filenameInput.size() < 64) {
+                filenameInput.insert(cursorPos, 1, c);
+                cursorPos++;
+                cursorVisible = true; cursorTimer = SDL_GetTicks();
+            }
+            return;
+        }
+        if (showOverlay && overlayType == "load" && !browsingFolder) {
+            if (ev.keysym.sym == SDLK_RETURN || ev.keysym.sym == SDLK_KP_ENTER) {
+                loadSelectedDrawing(); return;
+            }
+            if (ev.keysym.sym == SDLK_ESCAPE) { showOverlay = false; return; }
+            if (ev.keysym.sym == SDLK_UP && overlayScroll > 0) { overlayScroll--; return; }
+            if (ev.keysym.sym == SDLK_DOWN && overlayScroll < (int)overlayFiles.size()-1) { overlayScroll++; return; }
+            return;
+        }
+        if (showOverlay && browsingFolder) {
+            if (ev.keysym.sym == SDLK_ESCAPE) { browsingFolder = false; return; }
+            if (ev.keysym.sym == SDLK_UP && browseScroll > 0) { browseScroll--; return; }
+            if (ev.keysym.sym == SDLK_DOWN) { browseScroll++; return; }
+            if (ev.keysym.sym == SDLK_RETURN) { selectCurrentFolder(); return; }
+            return;
+        }
+
         if (ev.keysym.sym >= SDLK_1 && ev.keysym.sym <= SDLK_9) {
             int idx = ev.keysym.sym - SDLK_1;
             executeToolAction("color", idx);
@@ -425,9 +637,23 @@ void PiPaint::executeToolAction(const std::string& type, int index) {
         }
     } else if (type == "eraser") {
         canvas.toggleEraser();
+        shapeMode = ShapeMode::NONE;
     } else if (type == "fill") {
         canvas.toggleFill();
         fillArmed = canvas.isFillMode();
+        shapeMode = ShapeMode::NONE;
+    } else if (type == "shape_line") {
+        shapeMode = (shapeMode == ShapeMode::LINE) ? ShapeMode::NONE : ShapeMode::LINE;
+        fillArmed = false;
+        if (canvas.isEraserMode()) canvas.toggleEraser();
+    } else if (type == "shape_rect") {
+        shapeMode = (shapeMode == ShapeMode::RECT) ? ShapeMode::NONE : ShapeMode::RECT;
+        fillArmed = false;
+        if (canvas.isEraserMode()) canvas.toggleEraser();
+    } else if (type == "shape_ellipse") {
+        shapeMode = (shapeMode == ShapeMode::ELLIPSE) ? ShapeMode::NONE : ShapeMode::ELLIPSE;
+        fillArmed = false;
+        if (canvas.isEraserMode()) canvas.toggleEraser();
     } else if (type == "bg") {
         canvas.toggleBackground();
     } else if (type == "undo") {
@@ -451,81 +677,560 @@ void PiPaint::executeToolAction(const std::string& type, int index) {
     }
 }
 
+// ---------- helpers ----------
+
+static void renderText(SDL_Renderer* r, TTF_Font* font, const std::string& text,
+                       SDL_Color col, int x, int y) {
+    if (text.empty()) return;
+    SDL_Surface* s = TTF_RenderUTF8_Blended(font, text.c_str(), col);
+    if (!s) return;
+    SDL_Texture* t = SDL_CreateTextureFromSurface(r, s);
+    SDL_Rect dst = {x, y, s->w, s->h};
+    SDL_RenderCopy(r, t, nullptr, &dst);
+    SDL_FreeSurface(s);
+    SDL_DestroyTexture(t);
+}
+
+static void fillRoundRect(SDL_Renderer* r, SDL_Rect rect, int radius,
+                           Uint8 R, Uint8 G, Uint8 B, Uint8 A) {
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, R, G, B, A);
+    // Fill three rects to approximate rounded rect
+    SDL_Rect inner = {rect.x + radius, rect.y, rect.w - 2*radius, rect.h};
+    SDL_RenderFillRect(r, &inner);
+    SDL_Rect left  = {rect.x, rect.y + radius, radius, rect.h - 2*radius};
+    SDL_Rect right = {rect.x + rect.w - radius, rect.y + radius, radius, rect.h - 2*radius};
+    SDL_RenderFillRect(r, &left);
+    SDL_RenderFillRect(r, &right);
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+}
+
+// ---------- file list ----------
+
+void PiPaint::refreshFileList() {
+    overlayFiles.clear();
+    overlayScroll = 0;
+    selectedIndex = -1;
+    std::error_code ec;
+    for (auto& entry : fs::directory_iterator(currentBrowsePath, ec)) {
+        if (entry.is_regular_file(ec)) {
+            std::string ext = entry.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            if (ext == ".png" || ext == ".jpg" || ext == ".jpeg")
+                overlayFiles.push_back(entry.path().filename().string());
+        }
+    }
+    std::sort(overlayFiles.begin(), overlayFiles.end());
+}
+
+void PiPaint::refreshSubdirs() {
+    subdirs.clear();
+    browseScroll = 0;
+    selectedSubdir = -1;
+    std::error_code ec;
+    for (auto& entry : fs::directory_iterator(currentBrowsePath, ec)) {
+        if (entry.is_directory(ec))
+            subdirs.push_back(entry.path().filename().string());
+    }
+    std::sort(subdirs.begin(), subdirs.end());
+}
+
+std::string PiPaint::generateRandomFilename() {
+    return "drawing_" + std::to_string(time(nullptr)) + ".png";
+}
+
+// ---------- show overlays ----------
+
 void PiPaint::showSaveOverlay() {
-    std::cout << "Save overlay (placeholder)\n";
+    overlayType = "save";
+    showOverlay = true;
+    browsingFolder = false;
+    filenameInput = generateRandomFilename();
+    cursorPos = (int)filenameInput.size();
+    refreshFileList();
+    refreshSubdirs();
 }
 
 void PiPaint::showLoadOverlay() {
-    std::cout << "Load overlay (placeholder)\n";
+    overlayType = "load";
+    showOverlay = true;
+    browsingFolder = false;
+    filenameInput = "";
+    selectedIndex = -1;
+    refreshFileList();
+    refreshSubdirs();
 }
 
-void PiPaint::refreshFileList() {}
-std::string PiPaint::generateRandomFilename() { return "drawing_" + std::to_string(time(nullptr)) + ".png"; }
-void PiPaint::saveCurrentDrawing() {}
-void PiPaint::loadSelectedDrawing() {}
-void PiPaint::enterFolderBrowser() {}
-void PiPaint::refreshSubdirs() {}
-void PiPaint::goUp() {}
-void PiPaint::goHome() {}
-void PiPaint::goMedia() {}
-void PiPaint::selectCurrentFolder() {}
+// ---------- save / load ----------
+
+void PiPaint::saveCurrentDrawing() {
+    std::string name = filenameInput.empty() ? generateRandomFilename() : filenameInput;
+    // Ensure .png extension
+    if (name.size() < 4 || name.substr(name.size()-4) != ".png")
+        name += ".png";
+    std::string path = currentBrowsePath + "/" + name;
+    if (canvas.save(path))
+        std::cout << "Saved: " << path << "\n";
+    else
+        std::cerr << "Save failed: " << path << "\n";
+    showOverlay = false;
+}
+
+void PiPaint::loadSelectedDrawing() {
+    if (selectedIndex < 0 || selectedIndex >= (int)overlayFiles.size()) return;
+    std::string path = currentBrowsePath + "/" + overlayFiles[selectedIndex];
+    if (canvas.load(path))
+        std::cout << "Loaded: " << path << "\n";
+    else
+        std::cerr << "Load failed: " << path << "\n";
+    showOverlay = false;
+}
+
+// ---------- folder browser ----------
+
+void PiPaint::enterFolderBrowser() {
+    browsingFolder = true;
+    refreshSubdirs();
+}
+
+void PiPaint::goUp() {
+    fs::path p(currentBrowsePath);
+    if (p.has_parent_path() && p != p.root_path()) {
+        currentBrowsePath = p.parent_path().string();
+        refreshSubdirs();
+        refreshFileList();
+    }
+}
+
+void PiPaint::goHome() {
+    const char* home = getenv("HOME");
+    currentBrowsePath = home ? std::string(home) + "/pi-paint/drawings" : "/home/pi/pi-paint/drawings";
+    fs::create_directories(currentBrowsePath);
+    refreshSubdirs();
+    refreshFileList();
+    browsingFolder = false;
+}
+
+void PiPaint::goMedia() {
+    currentBrowsePath = "/media";
+    refreshSubdirs();
+    refreshFileList();
+    browsingFolder = false;
+}
+
+void PiPaint::selectCurrentFolder() {
+    if (selectedSubdir >= 0 && selectedSubdir < (int)subdirs.size()) {
+        currentBrowsePath += "/" + subdirs[selectedSubdir];
+        refreshSubdirs();
+        refreshFileList();
+        selectedSubdir = -1;
+    } else {
+        browsingFolder = false;
+    }
+}
+
+void PiPaint::commitShape(int x1, int y1, int x2, int y2) {
+    switch (shapeMode) {
+        case ShapeMode::LINE:
+            canvas.drawShapeLine(x1, y1, x2, y2);
+            break;
+        case ShapeMode::RECT:
+            canvas.drawShapeRect(x1, y1, x2, y2);
+            break;
+        case ShapeMode::ELLIPSE: {
+            int cx = (x1 + x2) / 2;
+            int cy = (y1 + y2) / 2;
+            int rx = std::abs(x2 - x1) / 2;
+            int ry = std::abs(y2 - y1) / 2;
+            canvas.drawShapeEllipse(cx, cy, rx, ry);
+            break;
+        }
+        default: break;
+    }
+}
+
+void PiPaint::drawGhostShape() {
+    if (!shapeDragging || shapeMode == ShapeMode::NONE) return;
+
+    int x1 = shapeStart.x,   y1 = shapeStart.y;
+    int x2 = shapeCurrent.x, y2 = shapeCurrent.y;
+
+    // Get current color from canvas
+    Uint32 col = canvas.getCurrentColor();
+    Uint8 r = (col >> 16) & 0xFF;
+    Uint8 g = (col >>  8) & 0xFF;
+    Uint8 b =  col        & 0xFF;
+
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(renderer, r, g, b, 180);
+
+    int thick = std::max(1, canvas.getPenSize());
+
+    if (shapeMode == ShapeMode::LINE) {
+        for (int t = -thick/2; t <= thick/2; t++) {
+            // Offset perpendicular — approximate with both axes
+            SDL_RenderDrawLine(renderer, x1+t, y1,   x2+t, y2);
+            SDL_RenderDrawLine(renderer, x1,   y1+t, x2,   y2+t);
+        }
+    } else if (shapeMode == ShapeMode::RECT) {
+        int left   = std::min(x1, x2), right  = std::max(x1, x2);
+        int top    = std::min(y1, y2), bottom = std::max(y1, y2);
+        for (int t = 0; t < thick; t++) {
+            SDL_Rect r = {left+t, top+t, right-left-2*t, bottom-top-2*t};
+            if (r.w > 0 && r.h > 0) SDL_RenderDrawRect(renderer, &r);
+        }
+    } else if (shapeMode == ShapeMode::ELLIPSE) {
+        int cx = (x1 + x2) / 2, cy = (y1 + y2) / 2;
+        int rx = std::abs(x2 - x1) / 2;
+        int ry = std::abs(y2 - y1) / 2;
+        if (rx > 0 && ry > 0) {
+            int steps = 2 * (rx + ry);
+            for (int i = 0; i < steps; i++) {
+                float a0 = 2.0f * M_PI * i       / steps;
+                float a1 = 2.0f * M_PI * (i + 1) / steps;
+                SDL_RenderDrawLine(renderer,
+                    cx + (int)(rx * cosf(a0)), cy + (int)(ry * sinf(a0)),
+                    cx + (int)(rx * cosf(a1)), cy + (int)(ry * sinf(a1)));
+            }
+        }
+    }
+
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+}
+
 void PiPaint::calibrate() {}
+
+// ---------- virtual keyboard ----------
+
+static const char* VK_ROWS[] = {
+    "1234567890-_",
+    "qwertyuiop",
+    "asdfghjkl.",
+    "zxcvbnm"
+};
+static const char* VK_ROWS_SHIFT[] = {
+    "!@#$%^&*()+=",
+    "QWERTYUIOP",
+    "ASDFGHJKL,",
+    "ZXCVBNM"
+};
+
+void PiPaint::drawVirtualKeyboard(int kbX, int kbY, int kbW) {
+    int keyH = 48, gap = 4;
+    SDL_Color dark  = {44, 44, 46, 255};
+    SDL_Color white = {255, 255, 255, 255};
+    for (int row = 0; row < 4; row++) {
+        const char* keys = vkShift ? VK_ROWS_SHIFT[row] : VK_ROWS[row];
+        int n = (int)strlen(keys);
+        int rowW = n * (keyH + gap) - gap;
+        int startX = kbX + (kbW - rowW) / 2;
+        for (int k = 0; k < n; k++) {
+            int kx = startX + k*(keyH+gap);
+            int ky = kbY + row*(keyH+gap);
+            SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+            { SDL_Rect _r={kx,ky,keyH,keyH}; SDL_RenderFillRect(renderer,&_r); }
+            SDL_SetRenderDrawColor(renderer, 180, 180, 185, 255);
+            { SDL_Rect _r={kx,ky,keyH,keyH}; SDL_RenderDrawRect(renderer,&_r); }
+            char label[2]={keys[k],0};
+            renderText(renderer, fontSmall, label, dark, kx+14, ky+12);
+        }
+    }
+    int botY = kbY + 4*(keyH+gap);
+    int shiftW=90, bspW=90, spaceW=kbW-shiftW-bspW-gap*2-20;
+    int botX = kbX+10;
+    SDL_SetRenderDrawColor(renderer, vkShift?200:230, vkShift?220:230, vkShift?255:235, 255);
+    { SDL_Rect _r={botX,botY,shiftW,keyH}; SDL_RenderFillRect(renderer,&_r); }
+    SDL_SetRenderDrawColor(renderer,180,180,185,255);
+    { SDL_Rect _r={botX,botY,shiftW,keyH}; SDL_RenderDrawRect(renderer,&_r); }
+    renderText(renderer, fontSmall, "Shift", dark, botX+14, botY+12);
+    botX+=shiftW+gap;
+    SDL_SetRenderDrawColor(renderer,255,255,255,255);
+    { SDL_Rect _r={botX,botY,spaceW,keyH}; SDL_RenderFillRect(renderer,&_r); }
+    SDL_SetRenderDrawColor(renderer,180,180,185,255);
+    { SDL_Rect _r={botX,botY,spaceW,keyH}; SDL_RenderDrawRect(renderer,&_r); }
+    renderText(renderer, fontSmall, "Space", dark, botX+spaceW/2-24, botY+12);
+    botX+=spaceW+gap;
+    SDL_SetRenderDrawColor(renderer,255,220,220,255);
+    { SDL_Rect _r={botX,botY,bspW,keyH}; SDL_RenderFillRect(renderer,&_r); }
+    SDL_SetRenderDrawColor(renderer,180,180,185,255);
+    { SDL_Rect _r={botX,botY,bspW,keyH}; SDL_RenderDrawRect(renderer,&_r); }
+    renderText(renderer, fontSmall, "<--", dark, botX+14, botY+12);
+}
+
+bool PiPaint::handleVKTap(int tx, int ty, int kbX, int kbY, int kbW) {
+    int keyH=48, gap=4;
+    for (int row=0; row<4; row++) {
+        const char* keys = vkShift ? VK_ROWS_SHIFT[row] : VK_ROWS[row];
+        int n=(int)strlen(keys);
+        int rowW=n*(keyH+gap)-gap;
+        int startX=kbX+(kbW-rowW)/2;
+        int ky=kbY+row*(keyH+gap);
+        if (ty>=ky && ty<ky+keyH) {
+            for (int k=0; k<n; k++) {
+                int kx=startX+k*(keyH+gap);
+                if (tx>=kx && tx<kx+keyH) {
+                    if ((int)filenameInput.size()<64) { filenameInput.insert(cursorPos,1,keys[k]); cursorPos++; }
+                    return true;
+                }
+            }
+        }
+    }
+    int botY=kbY+4*(keyH+gap);
+    int shiftW=90, bspW=90, spaceW=kbW-shiftW-bspW-gap*2-20;
+    int botX=kbX+10;
+    if (ty>=botY && ty<botY+keyH) {
+        if (tx>=botX && tx<botX+shiftW) { vkShift=!vkShift; return true; }
+        botX+=shiftW+gap;
+        if (tx>=botX && tx<botX+spaceW) {
+            if ((int)filenameInput.size()<64) { filenameInput.insert(cursorPos,1,' '); cursorPos++; }
+            return true;
+        }
+        botX+=spaceW+gap;
+        if (tx>=botX && tx<botX+bspW) {
+            if (cursorPos>0) { filenameInput.erase(cursorPos-1,1); cursorPos--; }
+            return true;
+        }
+    }
+    return false;
+}
+
+static void drawScrollbar(SDL_Renderer* r, int x, int y, int h,
+                           int total, int visible, int& scroll,
+                           TTF_Font* font, SDL_Color dark) {
+    int btnH=36;
+    bool canUp=(scroll>0), canDown=(scroll<total-visible);
+    SDL_SetRenderDrawColor(r, canUp?200:230, canUp?200:230, canUp?200:230, 255);
+    { SDL_Rect _r={x,y,36,btnH}; SDL_RenderFillRect(r,&_r); }
+    SDL_SetRenderDrawColor(r,180,180,185,255);
+    { SDL_Rect _r={x,y,36,btnH}; SDL_RenderDrawRect(r,&_r); }
+    renderText(r, font, "^", dark, x+11, y+8);
+    int downY=y+h-btnH;
+    SDL_SetRenderDrawColor(r, canDown?200:230, canDown?200:230, canDown?200:230, 255);
+    { SDL_Rect _r={x,downY,36,btnH}; SDL_RenderFillRect(r,&_r); }
+    SDL_SetRenderDrawColor(r,180,180,185,255);
+    { SDL_Rect _r={x,downY,36,btnH}; SDL_RenderDrawRect(r,&_r); }
+    renderText(r, font, "v", dark, x+11, downY+8);
+    int trackY=y+btnH, trackH=h-btnH*2;
+    SDL_SetRenderDrawColor(r,220,220,225,255);
+    { SDL_Rect _r={x+10,trackY,16,trackH}; SDL_RenderFillRect(r,&_r); }
+    if (total>visible && trackH>0) {
+        int thumbH=std::max(20,trackH*visible/total);
+        int thumbY=trackY+(trackH-thumbH)*scroll/(total-visible);
+        SDL_SetRenderDrawColor(r,150,150,160,255);
+        { SDL_Rect _r={x+10,thumbY,16,thumbH}; SDL_RenderFillRect(r,&_r); }
+    }
+}
+
+// Draws a semi-transparent highlight over a rect if lastTouchPos is inside it
+static void hoverHighlight(SDL_Renderer* r, SDL_Rect rect, SDL_Point touch) {
+    if (touch.x < 0) return;
+    if (touch.x >= rect.x && touch.x <= rect.x+rect.w &&
+        touch.y >= rect.y && touch.y <= rect.y+rect.h) {
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(r, 0, 122, 255, 60);
+        SDL_RenderFillRect(r, &rect);
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+    }
+}
+
+// ---------- drawOverlay ----------
+
+void PiPaint::drawOverlay() {
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 160);
+    { SDL_Rect _r={0,0,width,height}; SDL_RenderFillRect(renderer,&_r); }
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+
+    bool isSave=(overlayType=="save");
+    int panelW=720, panelH=isSave?860:560;
+    int panelX=(width-panelW)/2, panelY=(height-panelH)/2;
+    fillRoundRect(renderer,{panelX,panelY,panelW,panelH},12,245,245,250,255);
+    SDL_SetRenderDrawColor(renderer,180,180,185,255);
+    { SDL_Rect _r={panelX,panelY,panelW,panelH}; SDL_RenderDrawRect(renderer,&_r); }
+
+    SDL_Color dark={44,44,46,255}, muted={120,120,128,255}, white={255,255,255,255};
+    int px=panelX+24, py=panelY+18;
+
+    renderText(renderer, fontLarge, isSave?"Save drawing":"Load drawing", dark, px, py);
+    py+=52;
+    renderText(renderer, fontTiny, currentBrowsePath, muted, px, py);
+    py+=26;
+
+    // ---- folder browser ----
+    if (browsingFolder) {
+        renderText(renderer, fontMedium, "Choose folder", dark, px, py); py+=38;
+        int listH=220,rowH=44,sbW=40,listW=panelW-48-sbW;
+        SDL_Rect listBox={panelX+16,py,listW,listH};
+        SDL_SetRenderDrawColor(renderer,255,255,255,255); SDL_RenderFillRect(renderer,&listBox);
+        SDL_SetRenderDrawColor(renderer,200,200,205,255); SDL_RenderDrawRect(renderer,&listBox);
+        int visItems=listH/rowH;
+        for (int i=browseScroll; i<(int)subdirs.size()&&i<browseScroll+visItems; i++) {
+            int ry=py+(i-browseScroll)*rowH;
+            if (i==selectedSubdir) {
+                SDL_SetRenderDrawColor(renderer,180,210,255,255);
+                { SDL_Rect _r={panelX+16,ry,listW,rowH}; SDL_RenderFillRect(renderer,&_r); }
+            }
+            renderText(renderer,fontMedium,"> "+subdirs[i],dark,panelX+28,ry+10);
+            SDL_SetRenderDrawColor(renderer,220,220,225,255);
+            SDL_RenderDrawLine(renderer,panelX+16,ry+rowH,panelX+16+listW,ry+rowH);
+        }
+        if (subdirs.empty()) renderText(renderer,fontSmall,"No subfolders here",muted,panelX+28,py+14);
+        drawScrollbar(renderer,panelX+16+listW+4,py,listH,(int)subdirs.size(),visItems,browseScroll,fontSmall,dark);
+        py+=listH+14;
+        struct { const char* label; const char* action; } fbBtns[]=
+            {{"^ Up","up"},{"Home","home"},{"Media","media"},{"Select","select"},{"Cancel","cancel"}};
+        int bx=panelX+16;
+        for (auto& b : fbBtns) {
+            int bw=(std::string(b.action)=="select")?120:95;
+            bool pri=(std::string(b.action)=="select");
+            SDL_SetRenderDrawColor(renderer,pri?0:230,pri?122:230,pri?255:235,255);
+            { SDL_Rect _r={bx,py,bw,40}; SDL_RenderFillRect(renderer,&_r); }
+            SDL_SetRenderDrawColor(renderer,180,180,185,255);
+            { SDL_Rect _r={bx,py,bw,40}; SDL_RenderDrawRect(renderer,&_r); }
+            { SDL_Rect _r={bx,py,bw,40}; hoverHighlight(renderer,_r,lastTouchPos); }
+            renderText(renderer,fontSmall,b.label,pri?white:dark,bx+8,py+10);
+            bx+=bw+8;
+        }
+        return;
+    }
+
+    // ---- file list ----
+    int listH=180,rowH=44,sbW=40,listW=panelW-48-sbW,listY=py;
+    SDL_Rect listBox={panelX+16,listY,listW,listH};
+    SDL_SetRenderDrawColor(renderer,255,255,255,255); SDL_RenderFillRect(renderer,&listBox);
+    SDL_SetRenderDrawColor(renderer,200,200,205,255); SDL_RenderDrawRect(renderer,&listBox);
+    int visItems=listH/rowH;
+    for (int i=overlayScroll; i<(int)overlayFiles.size()&&i<overlayScroll+visItems; i++) {
+        int ry=listY+(i-overlayScroll)*rowH;
+        SDL_Rect rowR={panelX+16,ry,listW,rowH};
+        if (i==selectedIndex) {
+            SDL_SetRenderDrawColor(renderer,180,210,255,255);
+            SDL_RenderFillRect(renderer,&rowR);
+        }
+        hoverHighlight(renderer,rowR,lastTouchPos);
+        renderText(renderer,fontMedium,overlayFiles[i],dark,panelX+28,ry+10);
+        SDL_SetRenderDrawColor(renderer,220,220,225,255);
+        SDL_RenderDrawLine(renderer,panelX+16,ry+rowH,panelX+16+listW,ry+rowH);
+    }
+    if (overlayFiles.empty()) renderText(renderer,fontSmall,"No drawings found",muted,panelX+28,listY+14);
+    drawScrollbar(renderer,panelX+16+listW+4,listY,listH,(int)overlayFiles.size(),visItems,overlayScroll,fontSmall,dark);
+    py=listY+listH+14;
+
+    // ---- filename input + virtual keyboard (save only) ----
+    if (isSave) {
+        renderText(renderer,fontSmall,"Filename",muted,px,py); py+=24;
+        SDL_Rect inputBox={panelX+16,py,panelW-32,44};
+        SDL_SetRenderDrawColor(renderer,255,255,255,255); SDL_RenderFillRect(renderer,&inputBox);
+        SDL_SetRenderDrawColor(renderer,0,122,255,255);   SDL_RenderDrawRect(renderer,&inputBox);
+        renderText(renderer,fontMedium,filenameInput,dark,panelX+26,py+8);
+        Uint32 now=SDL_GetTicks();
+        if (now-cursorTimer>500) { cursorVisible=!cursorVisible; cursorTimer=now; }
+        if (cursorVisible) {
+            int cx=0,cy2=0;
+            TTF_SizeUTF8(fontMedium,filenameInput.substr(0,cursorPos).c_str(),&cx,&cy2);
+            SDL_SetRenderDrawColor(renderer,44,44,46,255);
+            SDL_RenderDrawLine(renderer,panelX+26+cx,py+6,panelX+26+cx,py+38);
+        }
+        py+=54;
+        drawVirtualKeyboard(panelX+8, py, panelW-16);
+        py+=5*(48+4)+14;
+    }
+
+    // ---- action buttons ----
+    struct BtnDef { std::string label,action; bool primary; };
+    std::vector<BtnDef> btns = isSave
+        ? std::vector<BtnDef>{{"Browse","browse",false},{"Save","save",true},{"Cancel","cancel",false}}
+        : std::vector<BtnDef>{{"Browse","browse",false},{"Load","load",true},{"Cancel","cancel",false}};
+    int bx=panelX+16;
+    for (auto& b : btns) {
+        int bw=b.primary?120:(b.action=="browse"?130:100);
+        SDL_SetRenderDrawColor(renderer,b.primary?0:230,b.primary?122:230,b.primary?255:235,255);
+        { SDL_Rect _r={bx,py,bw,42}; SDL_RenderFillRect(renderer,&_r); }
+        SDL_SetRenderDrawColor(renderer,180,180,185,255);
+        { SDL_Rect _r={bx,py,bw,42}; SDL_RenderDrawRect(renderer,&_r); }
+        { SDL_Rect _r={bx,py,bw,42}; hoverHighlight(renderer,_r,lastTouchPos); }
+        renderText(renderer,fontSmall,b.label,b.primary?white:dark,bx+10,py+11);
+        bx+=bw+10;
+    }
+}
 
 void PiPaint::run() {
     SDL_ShowCursor(SDL_ENABLE);
     SDL_Event e;
-    Uint32 lastTick = SDL_GetTicks();
+    const Uint32 FRAME_MS = 16; // ~60fps
+    Uint32 lastRender = SDL_GetTicks();
+
     while (true) {
+        // --- drain touch events (uses select() internally, no spin) ---
         std::vector<SDL_Event> touchEvents;
         touch.processEvents(touchEvents);
         for (auto& ev : touchEvents) {
             if (ev.type == SDL_FINGERDOWN) {
-                int x = ev.tfinger.x * width;
-                int y = ev.tfinger.y * height;
+                int x = (int)(ev.tfinger.x * width);
+                int y = (int)(ev.tfinger.y * height);
+                // Map pressure [0..1] to pen size [minSize..penSize]
+                // If device sends no pressure (0.5 default), size is unchanged
+                if (ev.tfinger.pressure > 0.0f && ev.tfinger.pressure != 0.5f) {
+                    int pressureSize = std::max(1, (int)(ev.tfinger.pressure * penSize * 2.0f));
+                    canvas.setSize(std::min(pressureSize, 50));
+                }
                 handleTouchDown(ev.tfinger.fingerId, x, y);
             } else if (ev.type == SDL_FINGERMOTION) {
-                int x = ev.tfinger.x * width;
-                int y = ev.tfinger.y * height;
+                int x = (int)(ev.tfinger.x * width);
+                int y = (int)(ev.tfinger.y * height);
+                if (ev.tfinger.pressure > 0.0f && ev.tfinger.pressure != 0.5f) {
+                    int pressureSize = std::max(1, (int)(ev.tfinger.pressure * penSize * 2.0f));
+                    canvas.setSize(std::min(pressureSize, 50));
+                }
                 handleTouchMove(ev.tfinger.fingerId, x, y);
             } else if (ev.type == SDL_FINGERUP) {
+                // Restore base pen size on lift
+                canvas.setSize(penSize);
                 handleTouchUp(ev.tfinger.fingerId);
             }
         }
 
+        // --- drain SDL events (mouse, keyboard, quit) ---
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) return;
             else if (e.type == SDL_MOUSEBUTTONDOWN) handleMouseButtonDown(e.button);
-            else if (e.type == SDL_MOUSEMOTION) handleMouseMotion(e.motion);
-            else if (e.type == SDL_MOUSEBUTTONUP) handleMouseButtonUp(e.button);
+            else if (e.type == SDL_MOUSEMOTION)     handleMouseMotion(e.motion);
+            else if (e.type == SDL_MOUSEBUTTONUP)   handleMouseButtonUp(e.button);
             else if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) handleKeyboard(e.key);
         }
 
-        updateCanvasTexture();
+        // --- render at ~60fps ---
+        Uint32 now = SDL_GetTicks();
+        if (now - lastRender < FRAME_MS) {
+            SDL_Delay(1); // yield CPU without sleeping a full frame
+            continue;
+        }
+        lastRender = now;
 
+        updateCanvasTexture();
         SDL_RenderClear(renderer);
         SDL_RenderCopy(renderer, canvasTexture, nullptr, nullptr);
         drawToolbar();
         if (showOverlay) drawOverlay();
 
-        if (activeFinger != -1 && activeFingerPos.y > toolbarHeight) {
+        // Ghost shape preview while dragging a shape tool
+        drawGhostShape();
+
+        // Pen cursor preview — hide during shape drag
+        if (activeFinger != -1 && !shapeDragging && activeFingerPos.y > toolbarHeight) {
             int r = penSize + 4;
             SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-            SDL_SetRenderDrawColor(renderer, 200,200,255,100);
+            SDL_SetRenderDrawColor(renderer, 200, 200, 255, 100);
             for (int dy = -r; dy <= r; dy++) {
-                for (int dx = -r; dx <= r; dx++) {
-                    if (dx*dx + dy*dy <= r*r) {
-                        SDL_RenderDrawPoint(renderer, activeFingerPos.x+dx, activeFingerPos.y+dy);
-                    }
-                }
+                int dx = (int)sqrt((float)(r*r - dy*dy));
+                SDL_RenderDrawLine(renderer,
+                    activeFingerPos.x - dx, activeFingerPos.y + dy,
+                    activeFingerPos.x + dx, activeFingerPos.y + dy);
             }
             SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
         }
 
         SDL_RenderPresent(renderer);
-
-        Uint32 now = SDL_GetTicks();
-        if (now - lastTick < 33) SDL_Delay(33 - (now - lastTick));
-        lastTick = now;
     }
 }
 

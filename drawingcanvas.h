@@ -22,6 +22,9 @@ public:
     void continueStroke(int x, int y, int fingerId);
     void endStroke(int fingerId);
     void floodFill(int x, int y);
+    void drawShapeLine(int x1, int y1, int x2, int y2);
+    void drawShapeRect(int x1, int y1, int x2, int y2);
+    void drawShapeEllipse(int cx, int cy, int rx, int ry);
     void undo();
     void redo();
     bool save(const std::string& filename);
@@ -32,6 +35,7 @@ public:
     bool isEraserMode() const { return eraserMode; }
     bool isFillMode() const { return fillMode; }
     Uint32 getCurrentColor() const { return currentColor; }
+    Uint32 getPixelAt(int x, int y);  // public eyedropper access
 
 private:
     int width, height;
@@ -48,6 +52,8 @@ private:
 
     void drawPoint(int x, int y);
     void drawCircle(int cx, int cy, int radius, Uint32 color);
+    void drawCircleAA(int cx, int cy, int radius, Uint32 color);
+    void blendPixel(int x, int y, Uint32 color, float alpha);
     void drawThickLine(int x1, int y1, int x2, int y2);
     void pushState();
     void restoreState(SDL_Surface* surf);

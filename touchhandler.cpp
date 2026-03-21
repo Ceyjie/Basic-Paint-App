@@ -9,8 +9,6 @@
 #include <dirent.h>
 #include <cstring>
 
-static const int RAW_THRESHOLD = 500;   // Filter out raw coordinates below this value
-
 static std::string findTouchDevice() {
     DIR* dir = opendir("/dev/input");
     if (!dir) return "";
@@ -41,8 +39,9 @@ static std::string findTouchDevice() {
 
 TouchHandler::TouchHandler(int w, int h) : screenW(w), screenH(h) {
     calibrationX = calibrationY = 0;
-    touchXMin = touchYMin = 0;
-    touchXMax = touchYMax = 4095;   // fallback values
+    touchXMax = 4095;
+    touchYMax = 4095;
+    pressureMax = 255;
     dev = nullptr;
     fd = -1;
 }
@@ -70,95 +69,86 @@ bool TouchHandler::init() {
 
     const struct input_absinfo* abs_x = libevdev_get_abs_info(dev, ABS_MT_POSITION_X);
     const struct input_absinfo* abs_y = libevdev_get_abs_info(dev, ABS_MT_POSITION_Y);
-    if (abs_x) {
-        touchXMin = abs_x->minimum;
-        touchXMax = abs_x->maximum;
-    }
-    if (abs_y) {
-        touchYMin = abs_y->minimum;
-        touchYMax = abs_y->maximum;
-    }
-    std::cout << "Touch range: " << touchXMin << "-" << touchXMax
-              << " x " << touchYMin << "-" << touchYMax << std::endl;
+    const struct input_absinfo* abs_p = libevdev_get_abs_info(dev, ABS_MT_PRESSURE);
+    if (abs_x) touchXMax = abs_x->maximum;
+    if (abs_y) touchYMax = abs_y->maximum;
+    if (abs_p) pressureMax = abs_p->maximum;
+    std::cout << "Touch range: " << touchXMax << "x" << touchYMax
+              << " pressure max: " << pressureMax << std::endl;
     return true;
 }
 
 void TouchHandler::processEvents(std::vector<SDL_Event>& events) {
     if (!dev) return;
 
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(fd, &fds);
+    struct timeval tv = {0, 0};
+    if (select(fd + 1, &fds, nullptr, nullptr, &tv) <= 0) return;
+
     struct input_event ev;
     int slot = 0;
-    // Temporary storage for one frame: slot -> {x, y, xSet, ySet}
-    struct SlotFrame {
-        int x = 0, y = 0;
-        bool xSet = false, ySet = false;
-    };
-    std::map<int, SlotFrame> frameSlots;
 
-    while (libevdev_has_event_pending(dev)) {
+    // Per-slot staging area — carry forward current state as defaults
+    struct StagedSlot { int x, y; float pressure; bool active; };
+    std::map<int, StagedSlot> staged;
+    for (auto& [s, st] : currentSlots)
+        staged[s] = {st.x, st.y, st.pressure, true};
+
+    while (true) {
         int rc = libevdev_next_event(dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+
+        if (rc == LIBEVDEV_READ_STATUS_SYNC) {
+            while (rc == LIBEVDEV_READ_STATUS_SYNC)
+                rc = libevdev_next_event(dev, LIBEVDEV_READ_FLAG_SYNC, &ev);
+            continue;
+        }
         if (rc == -EAGAIN) break;
-        if (rc < 0) continue;
+        if (rc < 0) break;
 
         if (ev.type == EV_ABS) {
             if (ev.code == ABS_MT_SLOT) {
                 slot = ev.value;
-            } else if (ev.code == ABS_MT_POSITION_X) {
-                frameSlots[slot].x = ev.value;
-                frameSlots[slot].xSet = true;
-            } else if (ev.code == ABS_MT_POSITION_Y) {
-                frameSlots[slot].y = ev.value;
-                frameSlots[slot].ySet = true;
-            }
-            // If you want to use pressure, add ABS_MT_PRESSURE here
-        } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
-            // Build a map of slots that have complete valid coordinates
-            std::map<int, SDL_Point> validSlots;
-
-            for (auto& [slot, sf] : frameSlots) {
-                if (sf.xSet && sf.ySet) {
-                    int rawX = sf.x;
-                    int rawY = sf.y;
-                    // Filter out coordinates that are too low (likely noise)
-                    if (rawX > RAW_THRESHOLD && rawY > RAW_THRESHOLD) {
-                        // Map to screen coordinates using the device's actual min/max
-                        int screenX = (rawX - touchXMin) * screenW / (touchXMax - touchXMin);
-                        int screenY = (rawY - touchYMin) * screenH / (touchYMax - touchYMin);
-                        applyCalibration(screenX, screenY);
-                        // Clamp to screen bounds
-                        screenX = std::max(0, std::min(screenW - 1, screenX));
-                        screenY = std::max(0, std::min(screenH - 1, screenY));
-                        validSlots[slot] = {screenX, screenY};
+            } else if (ev.code == ABS_MT_TRACKING_ID) {
+                if (ev.value == -1) {
+                    // Finger lifted
+                    auto it = currentSlots.find(slot);
+                    if (it != currentSlots.end()) {
+                        generateTouchEvent(SDL_FINGERUP, slot,
+                            it->second.x, it->second.y, it->second.pressure, events);
+                        currentSlots.erase(it);
+                        staged.erase(slot);
                     }
+                } else {
+                    // New finger — init staged entry with default pressure
+                    if (staged.find(slot) == staged.end())
+                        staged[slot] = {0, 0, 0.5f, true};
                 }
+            } else if (ev.code == ABS_MT_POSITION_X) {
+                staged[slot].x = ev.value * screenW / touchXMax;
+            } else if (ev.code == ABS_MT_POSITION_Y) {
+                staged[slot].y = ev.value * screenH / touchYMax;
+            } else if (ev.code == ABS_MT_PRESSURE) {
+                staged[slot].pressure = (pressureMax > 0)
+                    ? std::max(0.0f, std::min(1.0f, (float)ev.value / pressureMax))
+                    : 0.5f;
             }
+        } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+            for (auto& [s, ss] : staged) {
+                int x = ss.x, y = ss.y;
+                applyCalibration(x, y);
+                float pressure = ss.pressure;
 
-            // Generate events for new / moved touches
-            for (auto& [slot, pt] : validSlots) {
-                auto it = currentSlots.find(slot);
-                if (it == currentSlots.end()) {
-                    // New touch
-                    generateTouchEvent(SDL_FINGERDOWN, slot, pt.x, pt.y, events);
-                    currentSlots[slot] = pt;
-                } else if (it->second.x != pt.x || it->second.y != pt.y) {
-                    // Moved touch
-                    generateTouchEvent(SDL_FINGERMOTION, slot, pt.x, pt.y, events);
-                    it->second = pt;
+                if (currentSlots.find(s) == currentSlots.end()) {
+                    generateTouchEvent(SDL_FINGERDOWN, s, x, y, pressure, events);
+                } else {
+                    auto& prev = currentSlots[s];
+                    if (prev.x != x || prev.y != y || prev.pressure != pressure)
+                        generateTouchEvent(SDL_FINGERMOTION, s, x, y, pressure, events);
                 }
+                currentSlots[s] = {x, y, pressure};
             }
-
-            // Generate up events for slots that disappeared
-            std::vector<int> toErase;
-            for (auto& [slot, _] : currentSlots) {
-                if (validSlots.find(slot) == validSlots.end()) {
-                    generateTouchEvent(SDL_FINGERUP, slot, 0, 0, events);
-                    toErase.push_back(slot);
-                }
-            }
-            for (int slot : toErase) currentSlots.erase(slot);
-
-            // Clear frame data for next frame
-            frameSlots.clear();
         }
     }
 }
@@ -170,7 +160,7 @@ void TouchHandler::applyCalibration(int& x, int& y) {
     y = std::max(0, std::min(screenH - 1, y));
 }
 
-void TouchHandler::generateTouchEvent(int type, int fingerId, int x, int y, std::vector<SDL_Event>& events) {
+void TouchHandler::generateTouchEvent(int type, int fingerId, int x, int y, float pressure, std::vector<SDL_Event>& events) {
     SDL_Event e;
     e.type = type;
     e.tfinger.fingerId = fingerId;
@@ -178,6 +168,7 @@ void TouchHandler::generateTouchEvent(int type, int fingerId, int x, int y, std:
     e.tfinger.y = y / (float)screenH;
     e.tfinger.dx = 0;
     e.tfinger.dy = 0;
+    e.tfinger.pressure = pressure;
     events.push_back(e);
 }
 
