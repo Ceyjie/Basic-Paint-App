@@ -77,6 +77,9 @@ void DrawingCanvas::startStroke(int x, int y, int fingerId) {
         fillMode = false;
         return;
     }
+    // Always erase first — guarantees no stale anchor from a previous stroke
+    // on the same fingerId can ever connect to this new one.
+    activeStrokes.erase(fingerId);
     activeStrokes[fingerId] = {x, y};
     drawPoint(x, y);
 }

@@ -26,10 +26,9 @@ private:
     struct SlotState { int x, y; float pressure; };
     std::map<int, SlotState> currentSlots;   // slot -> screen coords + pressure
     int pressureMax;
+    int currentSlot = 0;  // persists across processEvents calls — kernel omits ABS_MT_SLOT when unchanged
     void applyCalibration(int& x, int& y);
     void generateTouchEvent(int type, int fingerId, int x, int y, float pressure, std::vector<SDL_Event>& events);
 };
 
 #endif
-
-

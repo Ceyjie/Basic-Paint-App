@@ -88,16 +88,12 @@ void TouchHandler::processEvents(std::vector<SDL_Event>& events) {
     if (select(fd + 1, &fds, nullptr, nullptr, &tv) <= 0) return;
 
     struct input_event ev;
-    int slot = 0;
+    // slot must persist across calls — some devices don't re-send ABS_MT_SLOT
+    // when only one finger is active, so we remember which slot we last saw.
 
     // Per-slot staging.
-    // hasPos  — slot received at least one real X+Y this frame (safe to emit DOWN)
-    // moved   — slot received at least one ABS event this frame (safe to emit MOTION)
-    // isNew   — slot got a fresh TRACKING_ID this frame
     struct StagedSlot { int x, y; float pressure; bool isNew; bool hasPos; bool moved; };
     std::map<int, StagedSlot> staged;
-    // Carry forward existing slots but mark them as NOT moved — they won't emit
-    // FINGERMOTION unless they actually receive new ABS events this frame.
     for (auto& [s, st] : currentSlots)
         staged[s] = {st.x, st.y, st.pressure, false, true, false};
 
@@ -113,58 +109,53 @@ void TouchHandler::processEvents(std::vector<SDL_Event>& events) {
 
         if (ev.type == EV_ABS) {
             if (ev.code == ABS_MT_SLOT) {
-                slot = ev.value;
+                currentSlot = ev.value;
             } else if (ev.code == ABS_MT_TRACKING_ID) {
                 if (ev.value == -1) {
-                    auto it = currentSlots.find(slot);
+                    auto it = currentSlots.find(currentSlot);
                     if (it != currentSlots.end()) {
-                        generateTouchEvent(SDL_FINGERUP, slot,
+                        generateTouchEvent(SDL_FINGERUP, currentSlot,
                             it->second.x, it->second.y, it->second.pressure, events);
                         currentSlots.erase(it);
-                        staged.erase(slot);
+                        staged.erase(currentSlot);
                     }
                 } else {
-                    // New finger — no position yet, don't emit DOWN until we have coords
-                    staged[slot] = {0, 0, 0.5f, true, false, false};
+                    staged[currentSlot] = {0, 0, 0.5f, true, false, false};
                 }
             } else if (ev.code == ABS_MT_POSITION_X) {
-                staged[slot].x = ev.value * screenW / touchXMax;
-                staged[slot].moved = true;
-                // Only mark hasPos once we've seen both axes; use Y arrival to confirm
+                auto& ss = staged[currentSlot];
+                ss.x = ev.value * screenW / touchXMax;
+                ss.moved = true;
             } else if (ev.code == ABS_MT_POSITION_Y) {
-                staged[slot].y = ev.value * screenH / touchYMax;
-                staged[slot].moved = true;
-                staged[slot].hasPos = true;  // Y arrived → we have a real coordinate pair
+                auto& ss = staged[currentSlot];
+                ss.y = ev.value * screenH / touchYMax;
+                ss.moved = true;
+                ss.hasPos = true;
             } else if (ev.code == ABS_MT_PRESSURE) {
-                staged[slot].pressure = (pressureMax > 0)
+                auto& ss = staged[currentSlot];
+                ss.pressure = (pressureMax > 0)
                     ? std::max(0.0f, std::min(1.0f, (float)ev.value / pressureMax))
                     : 0.5f;
-                staged[slot].moved = true;
+                ss.moved = true;
             }
         } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
             for (auto& [s, ss] : staged) {
                 int x = ss.x, y = ss.y;
                 applyCalibration(x, y);
                 float pressure = ss.pressure;
-
                 bool known = currentSlots.count(s) > 0;
 
                 if (ss.isNew) {
-                    // Only emit DOWN once we have a real position
                     if (ss.hasPos) {
                         generateTouchEvent(SDL_FINGERDOWN, s, x, y, pressure, events);
                         currentSlots[s] = {x, y, pressure};
                         ss.isNew = false;
                     }
-                    // else: skip — wait for next frame with real coords
                 } else if (known && ss.moved) {
-                    // Only emit MOTION if this slot actually received new data this frame
                     generateTouchEvent(SDL_FINGERMOTION, s, x, y, pressure, events);
                     currentSlots[s] = {x, y, pressure};
                 }
-                // Slots carried forward with moved=false emit nothing — no phantom lines
             }
-            // Reset moved flag for next frame
             for (auto& [s, ss] : staged) ss.moved = false;
         }
     }
