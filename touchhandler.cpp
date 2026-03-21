@@ -9,6 +9,8 @@
 #include <dirent.h>
 #include <cstring>
 
+static const int RAW_THRESHOLD = 500;   // Filter out raw coordinates below this value
+
 static std::string findTouchDevice() {
     DIR* dir = opendir("/dev/input");
     if (!dir) return "";
@@ -39,8 +41,8 @@ static std::string findTouchDevice() {
 
 TouchHandler::TouchHandler(int w, int h) : screenW(w), screenH(h) {
     calibrationX = calibrationY = 0;
-    touchXMax = 4095;
-    touchYMax = 4095;
+    touchXMin = touchYMin = 0;
+    touchXMax = touchYMax = 4095;   // fallback values
     dev = nullptr;
     fd = -1;
 }
@@ -68,9 +70,16 @@ bool TouchHandler::init() {
 
     const struct input_absinfo* abs_x = libevdev_get_abs_info(dev, ABS_MT_POSITION_X);
     const struct input_absinfo* abs_y = libevdev_get_abs_info(dev, ABS_MT_POSITION_Y);
-    if (abs_x) touchXMax = abs_x->maximum;
-    if (abs_y) touchYMax = abs_y->maximum;
-    std::cout << "Touch range: " << touchXMax << "x" << touchYMax << std::endl;
+    if (abs_x) {
+        touchXMin = abs_x->minimum;
+        touchXMax = abs_x->maximum;
+    }
+    if (abs_y) {
+        touchYMin = abs_y->minimum;
+        touchYMax = abs_y->maximum;
+    }
+    std::cout << "Touch range: " << touchXMin << "-" << touchXMax
+              << " x " << touchYMin << "-" << touchYMax << std::endl;
     return true;
 }
 
@@ -79,7 +88,12 @@ void TouchHandler::processEvents(std::vector<SDL_Event>& events) {
 
     struct input_event ev;
     int slot = 0;
-    std::map<int, SDL_Point> newSlots;
+    // Temporary storage for one frame: slot -> {x, y, xSet, ySet}
+    struct SlotFrame {
+        int x = 0, y = 0;
+        bool xSet = false, ySet = false;
+    };
+    std::map<int, SlotFrame> frameSlots;
 
     while (libevdev_has_event_pending(dev)) {
         int rc = libevdev_next_event(dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
@@ -90,39 +104,61 @@ void TouchHandler::processEvents(std::vector<SDL_Event>& events) {
             if (ev.code == ABS_MT_SLOT) {
                 slot = ev.value;
             } else if (ev.code == ABS_MT_POSITION_X) {
-                newSlots[slot].x = ev.value;
+                frameSlots[slot].x = ev.value;
+                frameSlots[slot].xSet = true;
             } else if (ev.code == ABS_MT_POSITION_Y) {
-                newSlots[slot].y = ev.value;
+                frameSlots[slot].y = ev.value;
+                frameSlots[slot].ySet = true;
             }
+            // If you want to use pressure, add ABS_MT_PRESSURE here
         } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
-            // Process new frame
-            for (auto& [slot, raw] : newSlots) {
-                int x = raw.x * screenW / touchXMax;
-                int y = raw.y * screenH / touchYMax;
-                applyCalibration(x, y);
-                std::cout << "Raw: " << raw.x << "," << raw.y << " -> Screen: " << x << "," << y << std::endl;
-                if (currentSlots.find(slot) == currentSlots.end()) {
-                    generateTouchEvent(SDL_FINGERDOWN, slot, x, y, events);
-                } else {
-                    auto& prev = currentSlots[slot];
-                    if (prev.x != x || prev.y != y) {
-                        generateTouchEvent(SDL_FINGERMOTION, slot, x, y, events);
+            // Build a map of slots that have complete valid coordinates
+            std::map<int, SDL_Point> validSlots;
+
+            for (auto& [slot, sf] : frameSlots) {
+                if (sf.xSet && sf.ySet) {
+                    int rawX = sf.x;
+                    int rawY = sf.y;
+                    // Filter out coordinates that are too low (likely noise)
+                    if (rawX > RAW_THRESHOLD && rawY > RAW_THRESHOLD) {
+                        // Map to screen coordinates using the device's actual min/max
+                        int screenX = (rawX - touchXMin) * screenW / (touchXMax - touchXMin);
+                        int screenY = (rawY - touchYMin) * screenH / (touchYMax - touchYMin);
+                        applyCalibration(screenX, screenY);
+                        // Clamp to screen bounds
+                        screenX = std::max(0, std::min(screenW - 1, screenX));
+                        screenY = std::max(0, std::min(screenH - 1, screenY));
+                        validSlots[slot] = {screenX, screenY};
                     }
                 }
-                currentSlots[slot] = {x, y};
             }
 
-            // Detect releases
+            // Generate events for new / moved touches
+            for (auto& [slot, pt] : validSlots) {
+                auto it = currentSlots.find(slot);
+                if (it == currentSlots.end()) {
+                    // New touch
+                    generateTouchEvent(SDL_FINGERDOWN, slot, pt.x, pt.y, events);
+                    currentSlots[slot] = pt;
+                } else if (it->second.x != pt.x || it->second.y != pt.y) {
+                    // Moved touch
+                    generateTouchEvent(SDL_FINGERMOTION, slot, pt.x, pt.y, events);
+                    it->second = pt;
+                }
+            }
+
+            // Generate up events for slots that disappeared
             std::vector<int> toErase;
             for (auto& [slot, _] : currentSlots) {
-                if (newSlots.find(slot) == newSlots.end()) {
+                if (validSlots.find(slot) == validSlots.end()) {
                     generateTouchEvent(SDL_FINGERUP, slot, 0, 0, events);
                     toErase.push_back(slot);
                 }
             }
             for (int slot : toErase) currentSlots.erase(slot);
 
-            newSlots.clear();
+            // Clear frame data for next frame
+            frameSlots.clear();
         }
     }
 }

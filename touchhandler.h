@@ -20,10 +20,11 @@ public:
 private:
     int screenW, screenH;
     int calibrationX, calibrationY;
-    int touchXMax, touchYMax;
+    int touchXMin, touchXMax;   // min and max raw X values from device
+    int touchYMin, touchYMax;   // min and max raw Y values from device
     struct libevdev* dev;
     int fd;
-    std::map<int, SDL_Point> currentSlots;   // slot -> raw coordinates
+    std::map<int, SDL_Point> currentSlots;   // slot -> current screen coordinates
     void applyCalibration(int& x, int& y);
     void generateTouchEvent(int type, int fingerId, int x, int y, std::vector<SDL_Event>& events);
 };
