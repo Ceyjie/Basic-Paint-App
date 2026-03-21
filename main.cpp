@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <string>
 #include <map>
+#include <set>
 #include <vector>
 #include <algorithm>
 #include <filesystem>
@@ -15,7 +16,7 @@ namespace fs = std::filesystem;
 
 // Colors
 static void hoverHighlight(SDL_Renderer* r, SDL_Rect rect, SDL_Point hover, SDL_Point tap, Uint32 tapTime, Uint32 flashMs);
-static const Uint32 TAP_FLASH_MS = 120;
+static const Uint32 TAP_FLASH_MS = 180;
 namespace {
     SDL_PixelFormat* _fmt = SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888);
     inline Uint32 _rgb(Uint8 r, Uint8 g, Uint8 b) { return SDL_MapRGB(_fmt, r, g, b); }
@@ -89,9 +90,10 @@ private:
     int browseScroll = 0;
     int selectedSubdir = -1;
 
-    int activeFinger = -1;
-    SDL_Point activeFingerPos;
-    SDL_Point lastTouchPos = {-1, -1};  // finger currently hovering
+    std::set<int>           activeFingers;    // all fingers currently on canvas
+    std::map<int,SDL_Point> activeFingerPos;  // per-finger last position
+    int shapeOwnerFinger = -1;
+    SDL_Point lastTouchPos = {-1, -1};
     SDL_Point lastTapPos   = {-1, -1};  // last tap position for flash
     Uint32    lastTapTime  = 0;          // when the tap happened
 
@@ -473,59 +475,66 @@ void PiPaint::handleTouchDown(int fingerId, int x, int y) {
         return;
     }
 
-    if (activeFinger != -1 && fingerId != activeFinger) {
+    // Track position for hover highlight on every finger everywhere
+    activeFingerPos[fingerId] = {x, y};
+    lastTouchPos = {x, y};
+
+    // Toolbar: only fire buttons when no canvas stroke is active
+    if (y <= toolbarHeight) {
+        if (activeFingers.empty()) {
+            for (auto& btn : toolbarButtons) {
+                if (x >= btn.rect.x && x <= btn.rect.x+btn.rect.w &&
+                    y >= btn.rect.y && y <= btn.rect.y+btn.rect.h) {
+                    executeToolAction(btn.type, btn.index);
+                    return;
+                }
+            }
+        }
         return;
     }
 
-    for (auto& btn : toolbarButtons) {
-        if (x >= btn.rect.x && x <= btn.rect.x+btn.rect.w &&
-            y >= btn.rect.y && y <= btn.rect.y+btn.rect.h) {
-
-            // All buttons fire immediately on single tap
-            executeToolAction(btn.type, btn.index);
-            return;
-        }
-    }
-
-    if (y > toolbarHeight) {
-        if (fillArmed) {
-            canvas.floodFill(x, y);
-            fillArmed = false;
-        } else if (shapeMode != ShapeMode::NONE) {
-            // Start shape drag
-            activeFinger = fingerId;
-            shapeStart   = {x, y};
-            shapeCurrent = {x, y};
+    // Canvas — each finger is fully independent
+    if (fillArmed) {
+        if (activeFingers.empty()) { canvas.floodFill(x, y); fillArmed = false; }
+    } else if (shapeMode != ShapeMode::NONE) {
+        if (shapeOwnerFinger == -1) {
+            shapeOwnerFinger = fingerId;
+            shapeStart = shapeCurrent = {x, y};
             shapeDragging = true;
-        } else {
-            activeFinger = fingerId;
-            activeFingerPos = {x, y};
-            canvas.startStroke(x, y, fingerId);
+            activeFingers.insert(fingerId);
         }
+    } else {
+        activeFingers.insert(fingerId);
+        canvas.startStroke(x, y, fingerId);
     }
 }
 
 void PiPaint::handleTouchMove(int fingerId, int x, int y) {
-    lastTouchPos = {x, y};  // always track for hover feedback
-    if (fingerId != activeFinger || y <= toolbarHeight) return;
-    if (shapeDragging) {
-        shapeCurrent = {x, y};  // ghost redrawn in run loop
-    } else {
+    lastTouchPos = {x, y};
+    activeFingerPos[fingerId] = {x, y};
+
+    if (!activeFingers.count(fingerId)) return;
+    if (y <= toolbarHeight) return;
+
+    if (shapeDragging && fingerId == shapeOwnerFinger) {
+        shapeCurrent = {x, y};
+    } else if (!shapeDragging) {
         canvas.continueStroke(x, y, fingerId);
-        activeFingerPos = {x, y};
     }
 }
 
 void PiPaint::handleTouchUp(int fingerId) {
-    lastTouchPos = {-1, -1};  // clear hover so nothing stays lit after lift
-    if (fingerId != activeFinger) return;
-    if (shapeDragging) {
+    activeFingers.erase(fingerId);
+    activeFingerPos.erase(fingerId);
+    if (activeFingers.empty()) lastTouchPos = {-1, -1};
+
+    if (shapeDragging && fingerId == shapeOwnerFinger) {
         commitShape(shapeStart.x, shapeStart.y, shapeCurrent.x, shapeCurrent.y);
         shapeDragging = false;
+        shapeOwnerFinger = -1;
     } else {
         canvas.endStroke(fingerId);
     }
-    activeFinger = -1;
 }
 
 void PiPaint::handleMouseButtonDown(SDL_MouseButtonEvent& ev) {
@@ -534,13 +543,10 @@ void PiPaint::handleMouseButtonDown(SDL_MouseButtonEvent& ev) {
 
 void PiPaint::handleMouseMotion(SDL_MouseMotionEvent& ev) {
     lastTouchPos = {ev.x, ev.y};
-    if (activeFinger != 0 || ev.y <= toolbarHeight) return;
-    if (shapeDragging) {
-        shapeCurrent = {ev.x, ev.y};
-    } else {
-        canvas.continueStroke(ev.x, ev.y, 0);
-        activeFingerPos = {ev.x, ev.y};
-    }
+    activeFingerPos[0] = {ev.x, ev.y};
+    if (!activeFingers.count(0) || ev.y <= toolbarHeight) return;
+    if (shapeDragging) { shapeCurrent = {ev.x, ev.y}; }
+    else { canvas.continueStroke(ev.x, ev.y, 0); }
 }
 
 void PiPaint::handleMouseButtonUp(SDL_MouseButtonEvent& ev) {
@@ -1053,11 +1059,11 @@ static void hoverHighlight(SDL_Renderer* r, SDL_Rect rect,
     SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
     if (isTap) {
         float t = 1.0f - (float)(now - tapTime) / flashMs;
-        Uint8 alpha = (Uint8)(t * t * 180);
+        Uint8 alpha = (Uint8)(t * 220);   // bright immediate flash, linear fade
         SDL_SetRenderDrawColor(r, 255, 255, 255, alpha);
         SDL_RenderFillRect(r, &rect);
     } else if (isHover) {
-        SDL_SetRenderDrawColor(r, 255, 160, 40, 45);
+        SDL_SetRenderDrawColor(r, 255, 160, 40, 60);  // slightly more visible orange tint
         SDL_RenderFillRect(r, &rect);
     }
     SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
@@ -1364,19 +1370,8 @@ void PiPaint::run() {
         // Ghost shape preview while dragging a shape tool
         drawGhostShape();
 
-        // Pen cursor preview — hide during shape drag
-        if (activeFinger != -1 && !shapeDragging && activeFingerPos.y > toolbarHeight) {
-            int r = penSize + 4;
-            SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-            SDL_SetRenderDrawColor(renderer, 200, 200, 255, 100);
-            for (int dy = -r; dy <= r; dy++) {
-                int dx = (int)sqrt((float)(r*r - dy*dy));
-                SDL_RenderDrawLine(renderer,
-                    activeFingerPos.x - dx, activeFingerPos.y + dy,
-                    activeFingerPos.x + dx, activeFingerPos.y + dy);
-            }
-            SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
-        }
+        // No per-finger circle cursor — toolbar buttons already highlight via hoverHighlight()
+        // and canvas drawing gives direct ink feedback.
 
         SDL_RenderPresent(renderer);
     }
