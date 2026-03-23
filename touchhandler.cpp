@@ -88,14 +88,19 @@ void TouchHandler::processEvents(std::vector<SDL_Event>& events) {
     if (select(fd + 1, &fds, nullptr, nullptr, &tv) <= 0) return;
 
     struct input_event ev;
-    // slot must persist across calls — some devices don't re-send ABS_MT_SLOT
-    // when only one finger is active, so we remember which slot we last saw.
-
-    // Per-slot staging.
-    struct StagedSlot { int x, y; float pressure; bool isNew; bool hasPos; bool moved; };
+    // Staging area: tracking ID -> staged data
+    struct StagedSlot {
+        int x, y;
+        float pressure;
+        bool hasPos;
+        bool moved;
+    };
     std::map<int, StagedSlot> staged;
-    for (auto& [s, st] : currentSlots)
-        staged[s] = {st.x, st.y, st.pressure, false, true, false};
+
+    // Copy existing states into staged as base
+    for (auto& [tid, state] : currentStates) {
+        staged[tid] = {state.x, state.y, state.pressure, true, false};
+    }
 
     while (true) {
         int rc = libevdev_next_event(dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
@@ -110,53 +115,81 @@ void TouchHandler::processEvents(std::vector<SDL_Event>& events) {
         if (ev.type == EV_ABS) {
             if (ev.code == ABS_MT_SLOT) {
                 currentSlot = ev.value;
-            } else if (ev.code == ABS_MT_TRACKING_ID) {
+            }
+            else if (ev.code == ABS_MT_TRACKING_ID) {
                 if (ev.value == -1) {
-                    auto it = currentSlots.find(currentSlot);
-                    if (it != currentSlots.end()) {
-                        generateTouchEvent(SDL_FINGERUP, currentSlot,
-                            it->second.x, it->second.y, it->second.pressure, events);
-                        currentSlots.erase(it);
-                        staged.erase(currentSlot);
+                    // Finger lifted: remove from mapping and generate UP event
+                    auto it = slotToTrackingId.find(currentSlot);
+                    if (it != slotToTrackingId.end()) {
+                        int trackingId = it->second;
+                        auto stateIt = currentStates.find(trackingId);
+                        if (stateIt != currentStates.end()) {
+                            generateTouchEvent(SDL_FINGERUP, trackingId,
+                                               stateIt->second.x, stateIt->second.y,
+                                               stateIt->second.pressure, events);
+                            currentStates.erase(stateIt);
+                        }
+                        slotToTrackingId.erase(it);
+                        staged.erase(trackingId);
                     }
                 } else {
-                    staged[currentSlot] = {0, 0, 0.5f, true, false, false};
+                    // New finger: store mapping slot -> tracking ID
+                    slotToTrackingId[currentSlot] = ev.value;
+                    // Initialize staged entry for this tracking ID
+                    staged[ev.value] = {0, 0, 0.5f, false, false};
                 }
-            } else if (ev.code == ABS_MT_POSITION_X) {
-                auto& ss = staged[currentSlot];
-                ss.x = ev.value * screenW / touchXMax;
-                ss.moved = true;
-            } else if (ev.code == ABS_MT_POSITION_Y) {
-                auto& ss = staged[currentSlot];
-                ss.y = ev.value * screenH / touchYMax;
-                ss.moved = true;
-                ss.hasPos = true;
-            } else if (ev.code == ABS_MT_PRESSURE) {
-                auto& ss = staged[currentSlot];
-                ss.pressure = (pressureMax > 0)
-                    ? std::max(0.0f, std::min(1.0f, (float)ev.value / pressureMax))
-                    : 0.5f;
-                ss.moved = true;
             }
-        } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
-            for (auto& [s, ss] : staged) {
+            else if (ev.code == ABS_MT_POSITION_X) {
+                auto it = slotToTrackingId.find(currentSlot);
+                if (it != slotToTrackingId.end()) {
+                    int tid = it->second;
+                    auto& ss = staged[tid];
+                    ss.x = ev.value * screenW / touchXMax;
+                    ss.moved = true;
+                }
+            }
+            else if (ev.code == ABS_MT_POSITION_Y) {
+                auto it = slotToTrackingId.find(currentSlot);
+                if (it != slotToTrackingId.end()) {
+                    int tid = it->second;
+                    auto& ss = staged[tid];
+                    ss.y = ev.value * screenH / touchYMax;
+                    ss.moved = true;
+                    ss.hasPos = true;
+                }
+            }
+            else if (ev.code == ABS_MT_PRESSURE) {
+                auto it = slotToTrackingId.find(currentSlot);
+                if (it != slotToTrackingId.end()) {
+                    int tid = it->second;
+                    auto& ss = staged[tid];
+                    ss.pressure = (pressureMax > 0)
+                        ? std::max(0.0f, std::min(1.0f, (float)ev.value / pressureMax))
+                        : 0.5f;
+                    ss.moved = true;
+                }
+            }
+        }
+        else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+            // Commit all staged changes
+            for (auto& [tid, ss] : staged) {
                 int x = ss.x, y = ss.y;
                 applyCalibration(x, y);
                 float pressure = ss.pressure;
-                bool known = currentSlots.count(s) > 0;
+                bool known = currentStates.count(tid) > 0;
 
-                if (ss.isNew) {
-                    if (ss.hasPos) {
-                        generateTouchEvent(SDL_FINGERDOWN, s, x, y, pressure, events);
-                        currentSlots[s] = {x, y, pressure};
-                        ss.isNew = false;
-                    }
+                if (!known && ss.hasPos) {
+                    // New touch: generate DOWN event
+                    generateTouchEvent(SDL_FINGERDOWN, tid, x, y, pressure, events);
+                    currentStates[tid] = {x, y, pressure};
                 } else if (known && ss.moved) {
-                    generateTouchEvent(SDL_FINGERMOTION, s, x, y, pressure, events);
-                    currentSlots[s] = {x, y, pressure};
+                    // Existing touch moved: generate MOTION event
+                    generateTouchEvent(SDL_FINGERMOTION, tid, x, y, pressure, events);
+                    currentStates[tid] = {x, y, pressure};
                 }
             }
-            for (auto& [s, ss] : staged) ss.moved = false;
+            // Reset moved flag for next cycle
+            for (auto& [tid, ss] : staged) ss.moved = false;
         }
     }
 }

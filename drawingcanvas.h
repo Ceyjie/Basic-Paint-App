@@ -12,9 +12,8 @@ public:
     DrawingCanvas(int width, int height);
     ~DrawingCanvas();
 
-    void resetHistory();
-
     void clear();
+    void resetToBlank();                // discard history and start fresh
     void setColor(Uint8 r, Uint8 g, Uint8 b);
     void setSize(int size);
     void toggleEraser();
@@ -37,7 +36,7 @@ public:
     bool isEraserMode() const { return eraserMode; }
     bool isFillMode() const { return fillMode; }
     Uint32 getCurrentColor() const { return currentColor; }
-    Uint32 getPixelAt(int x, int y);  // public eyedropper access
+    Uint32 getPixelAt(int x, int y);
 
 private:
     int width, height;
@@ -47,7 +46,7 @@ private:
     int penSize;
     int minSize, maxSize;
     bool eraserMode, fillMode;
-    std::map<int, SDL_Point> activeStrokes;   // fingerId -> last position
+    std::map<int, SDL_Point> activeStrokes;
     std::deque<SDL_Surface*> undoStack;
     std::deque<SDL_Surface*> redoStack;
     int maxUndo = 20;
@@ -64,3 +63,4 @@ private:
 };
 
 #endif
+

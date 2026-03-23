@@ -14,9 +14,8 @@ DrawingCanvas::DrawingCanvas(int w, int h) : width(w), height(h) {
     maxSize = 50;
     eraserMode = false;
     fillMode = false;
-    // Fill without pushState — the blank canvas is the implicit undo base state
     SDL_FillRect(canvas, nullptr, backgroundColor);
-    pushState();  // one initial snapshot so undo() always has something to fall back to
+    pushState();
 }
 
 DrawingCanvas::~DrawingCanvas() {
@@ -27,6 +26,15 @@ DrawingCanvas::~DrawingCanvas() {
 
 void DrawingCanvas::clear() {
     SDL_FillRect(canvas, nullptr, backgroundColor);
+    pushState();
+}
+
+void DrawingCanvas::resetToBlank() {
+    SDL_FillRect(canvas, nullptr, backgroundColor);
+    for (auto s : undoStack) SDL_FreeSurface(s);
+    for (auto s : redoStack) SDL_FreeSurface(s);
+    undoStack.clear();
+    redoStack.clear();
     pushState();
 }
 
@@ -77,8 +85,6 @@ void DrawingCanvas::startStroke(int x, int y, int fingerId) {
         fillMode = false;
         return;
     }
-    // Always erase first — guarantees no stale anchor from a previous stroke
-    // on the same fingerId can ever connect to this new one.
     activeStrokes.erase(fingerId);
     activeStrokes[fingerId] = {x, y};
     drawPoint(x, y);
@@ -93,7 +99,7 @@ void DrawingCanvas::continueStroke(int x, int y, int fingerId) {
 
 void DrawingCanvas::endStroke(int fingerId) {
     if (activeStrokes.erase(fingerId) > 0) {
-        pushState();  // snapshot only when stroke is complete
+        pushState();
     }
 }
 
@@ -103,7 +109,6 @@ void DrawingCanvas::drawPoint(int x, int y) {
 }
 
 void DrawingCanvas::drawCircle(int cx, int cy, int radius, Uint32 color) {
-    // Draw filled circle using scanline algorithm
     int r2 = radius * radius;
     for (int y = -radius; y <= radius; y++) {
         int dx = (int)sqrt(r2 - y*y);
@@ -117,7 +122,6 @@ void DrawingCanvas::drawCircle(int cx, int cy, int radius, Uint32 color) {
     }
 }
 
-// Alpha-blend a single pixel onto the canvas surface
 void DrawingCanvas::blendPixel(int x, int y, Uint32 color, float alpha) {
     if (x < 0 || x >= width || y < 0 || y >= height || alpha <= 0.0f) return;
     if (alpha >= 1.0f) { setPixel(x, y, color); return; }
@@ -136,7 +140,6 @@ void DrawingCanvas::blendPixel(int x, int y, Uint32 color, float alpha) {
     *px = SDL_MapRGB(canvas->format, r, g, b);
 }
 
-// Anti-aliased filled circle — hard fill inside, blended fringe on the edge
 void DrawingCanvas::drawCircleAA(int cx, int cy, int radius, Uint32 color) {
     if (radius <= 1) { drawCircle(cx, cy, radius, color); return; }
 
@@ -146,25 +149,20 @@ void DrawingCanvas::drawCircleAA(int cx, int cy, int radius, Uint32 color) {
 
     for (int y = iy0; y <= iy1; y++) {
         float dy = (float)(y - cy);
-        // Distance from pixel centre to circle edge
         float edgeDist = r - std::abs(dy);
         if (edgeDist < -1.0f) continue;
 
-        // For each row, compute the exact half-width at this y
         float halfW = std::sqrt(std::max(0.0f, r*r - dy*dy));
         int x0 = (int)(cx - halfW);
         int x1 = (int)(cx + halfW);
 
-        // Solid interior
         for (int x = std::max(0, x0); x <= std::min(width-1, x1); x++)
             setPixel(x, y, color);
 
-        // Left fringe — fractional coverage
         float leftFrac = (cx - halfW) - (float)x0;
         if (leftFrac > 0.0f)
             blendPixel(x0 - 1, y, color, leftFrac);
 
-        // Right fringe
         float rightFrac = (float)(x1 + 1) - (cx + halfW);
         if (rightFrac > 0.0f)
             blendPixel(x1 + 1, y, color, rightFrac);
@@ -172,7 +170,6 @@ void DrawingCanvas::drawCircleAA(int cx, int cy, int radius, Uint32 color) {
 }
 
 void DrawingCanvas::drawThickLine(int x1, int y1, int x2, int y2) {
-    // Bresenham line algorithm
     int dx = abs(x2 - x1), dy = abs(y2 - y1);
     int sx = x1 < x2 ? 1 : -1, sy = y1 < y2 ? 1 : -1;
     int err = dx - dy;
@@ -205,7 +202,7 @@ void DrawingCanvas::floodFill(int x, int y) {
         for (int dx = -1; dx <= 1; dx++) {
             for (int dy = -1; dy <= 1; dy++) {
                 if (dx == 0 && dy == 0) continue;
-                if (dx != 0 && dy != 0) continue; // 4‑direction only
+                if (dx != 0 && dy != 0) continue;
                 int nx = p.x + dx, ny = p.y + dy;
                 if (nx >= 0 && nx < width && ny >= 0 && ny < height && !visited[nx][ny]) {
                     if (getPixel(nx, ny) == target) {
@@ -230,7 +227,6 @@ void DrawingCanvas::drawShapeRect(int x1, int y1, int x2, int y2) {
     int right  = std::max(x1, x2);
     int top    = std::min(y1, y2);
     int bottom = std::max(y1, y2);
-    // Draw four sides as thick lines
     drawThickLine(left,  top,    right, top);
     drawThickLine(right, top,    right, bottom);
     drawThickLine(right, bottom, left,  bottom);
@@ -242,8 +238,6 @@ void DrawingCanvas::drawShapeEllipse(int cx, int cy, int rx, int ry) {
     if (rx <= 0 || ry <= 0) return;
     pushState();
     Uint32 color = eraserMode ? backgroundColor : currentColor;
-    // Midpoint ellipse — plot filled circle stamps at each perimeter point
-    // Use parametric stepping fine enough to leave no gaps
     int steps = 2 * (rx + ry);
     for (int i = 0; i <= steps; i++) {
         float angle = 2.0f * M_PI * i / steps;
@@ -313,12 +307,4 @@ void DrawingCanvas::pushState() {
 
 void DrawingCanvas::restoreState(SDL_Surface* surf) {
     SDL_BlitSurface(surf, nullptr, canvas, nullptr);
-}
-
-void DrawingCanvas::resetHistory() {
-    for (auto s : undoStack) SDL_FreeSurface(s);
-    for (auto s : redoStack) SDL_FreeSurface(s);
-    undoStack.clear();
-    redoStack.clear();
-    pushState();
 }

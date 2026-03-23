@@ -23,12 +23,18 @@ private:
     int touchXMax, touchYMax;
     struct libevdev* dev;
     int fd;
-    struct SlotState { int x, y; float pressure; };
-    std::map<int, SlotState> currentSlots;   // slot -> screen coords + pressure
     int pressureMax;
-    int currentSlot = 0;  // persists across processEvents calls — kernel omits ABS_MT_SLOT when unchanged
+    int currentSlot = 0;
+
+    // Map slot -> tracking ID (for active touches)
+    std::map<int, int> slotToTrackingId;
+    // Map tracking ID -> current state (coordinates, pressure)
+    struct SlotState { int x, y; float pressure; };
+    std::map<int, SlotState> currentStates;
+
     void applyCalibration(int& x, int& y);
     void generateTouchEvent(int type, int fingerId, int x, int y, float pressure, std::vector<SDL_Event>& events);
 };
 
 #endif
+
