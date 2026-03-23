@@ -7,6 +7,7 @@
 
 DrawingCanvas::DrawingCanvas(int w, int h) : width(w), height(h) {
     canvas = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
+    background = nullptr;
     currentColor = SDL_MapRGB(canvas->format, 0, 0, 0);
     backgroundColor = SDL_MapRGB(canvas->format, 255, 255, 255);
     penSize = 5;
@@ -14,23 +15,34 @@ DrawingCanvas::DrawingCanvas(int w, int h) : width(w), height(h) {
     maxSize = 50;
     eraserMode = false;
     fillMode = false;
-    SDL_FillRect(canvas, nullptr, backgroundColor);
+
+    // Make canvas transparent
+    SDL_FillRect(canvas, nullptr, SDL_MapRGBA(canvas->format, 0,0,0,0));
     pushState();
 }
 
 DrawingCanvas::~DrawingCanvas() {
     SDL_FreeSurface(canvas);
+    if (background) SDL_FreeSurface(background);
     for (auto s : undoStack) SDL_FreeSurface(s);
     for (auto s : redoStack) SDL_FreeSurface(s);
 }
 
 void DrawingCanvas::clear() {
-    SDL_FillRect(canvas, nullptr, backgroundColor);
+    // Clear drawing layer to transparent
+    SDL_FillRect(canvas, nullptr, SDL_MapRGBA(canvas->format, 0,0,0,0));
     pushState();
 }
 
 void DrawingCanvas::resetToBlank() {
-    SDL_FillRect(canvas, nullptr, backgroundColor);
+    // Clear drawing layer to transparent
+    SDL_FillRect(canvas, nullptr, SDL_MapRGBA(canvas->format, 0,0,0,0));
+    // Discard background
+    if (background) {
+        SDL_FreeSurface(background);
+        background = nullptr;
+    }
+    // Reset undo/redo
     for (auto s : undoStack) SDL_FreeSurface(s);
     for (auto s : redoStack) SDL_FreeSurface(s);
     undoStack.clear();
@@ -59,21 +71,28 @@ void DrawingCanvas::toggleFill() {
 }
 
 void DrawingCanvas::toggleBackground() {
+    // This toggles the background color of the drawing layer only
+    // (does not affect loaded background image)
     Uint32 oldBg = backgroundColor;
     backgroundColor = (oldBg == SDL_MapRGB(canvas->format, 255,255,255)) ?
                        SDL_MapRGB(canvas->format, 0,0,0) :
                        SDL_MapRGB(canvas->format, 255,255,255);
+    // We need to change all non‑transparent pixels on the drawing layer
+    // to their inverted color relative to the new background? Wait, the old toggleBackground
+    // used to invert non‑background pixels. That was a feature. We keep that, but only on the canvas.
     Uint32* pixels = (Uint32*)canvas->pixels;
     int totalPixels = width * height;
     for (int i = 0; i < totalPixels; i++) {
         Uint32 pix = pixels[i];
-        if (pix != oldBg) {
+        // Ignore transparent pixels (alpha 0)
+        if ((pix >> 24) == 0) continue;
+        if (pix == oldBg) {
+            pixels[i] = backgroundColor;
+        } else {
             Uint8 r = (pix >> 16) & 0xFF;
             Uint8 g = (pix >> 8) & 0xFF;
             Uint8 b = pix & 0xFF;
             pixels[i] = SDL_MapRGB(canvas->format, 255 - r, 255 - g, 255 - b);
-        } else {
-            pixels[i] = backgroundColor;
         }
     }
     pushState();
@@ -104,7 +123,7 @@ void DrawingCanvas::endStroke(int fingerId) {
 }
 
 void DrawingCanvas::drawPoint(int x, int y) {
-    Uint32 color = eraserMode ? backgroundColor : currentColor;
+    Uint32 color = eraserMode ? SDL_MapRGBA(canvas->format, 0,0,0,0) : currentColor;
     drawCircleAA(x, y, penSize, color);
 }
 
@@ -116,7 +135,7 @@ void DrawingCanvas::drawCircle(int cx, int cy, int radius, Uint32 color) {
         int x2 = cx + dx;
         for (int x = x1; x <= x2; x++) {
             if (x >= 0 && x < width && cy+y >= 0 && cy+y < height) {
-                ((Uint32*)canvas->pixels)[(cy+y) * canvas->w + x] = color;
+                setPixel(x, cy+y, color, canvas);
             }
         }
     }
@@ -124,20 +143,30 @@ void DrawingCanvas::drawCircle(int cx, int cy, int radius, Uint32 color) {
 
 void DrawingCanvas::blendPixel(int x, int y, Uint32 color, float alpha) {
     if (x < 0 || x >= width || y < 0 || y >= height || alpha <= 0.0f) return;
-    if (alpha >= 1.0f) { setPixel(x, y, color); return; }
-
     Uint32* px = &((Uint32*)canvas->pixels)[y * canvas->w + x];
+    if (alpha >= 1.0f) {
+        *px = color;
+        return;
+    }
+
     Uint8 sr = (color >> 16) & 0xFF;
     Uint8 sg = (color >>  8) & 0xFF;
     Uint8 sb =  color        & 0xFF;
+    Uint8 sa = (color >> 24) & 0xFF;
+
     Uint8 dr = (*px >> 16) & 0xFF;
     Uint8 dg = (*px >>  8) & 0xFF;
     Uint8 db =  *px        & 0xFF;
+    Uint8 da = (*px >> 24) & 0xFF;
 
-    Uint8 r = (Uint8)(sr * alpha + dr * (1.0f - alpha));
-    Uint8 g = (Uint8)(sg * alpha + dg * (1.0f - alpha));
-    Uint8 b = (Uint8)(sb * alpha + db * (1.0f - alpha));
-    *px = SDL_MapRGB(canvas->format, r, g, b);
+    // Alpha blend (over operation)
+    float a = sa * alpha;
+    float inv_a = 1.0f - a;
+    Uint8 r = (Uint8)(sr * a + dr * inv_a);
+    Uint8 g = (Uint8)(sg * a + dg * inv_a);
+    Uint8 b = (Uint8)(sb * a + db * inv_a);
+    Uint8 a_out = (Uint8)(sa * a + da * inv_a);
+    *px = (a_out << 24) | (r << 16) | (g << 8) | b;
 }
 
 void DrawingCanvas::drawCircleAA(int cx, int cy, int radius, Uint32 color) {
@@ -156,13 +185,16 @@ void DrawingCanvas::drawCircleAA(int cx, int cy, int radius, Uint32 color) {
         int x0 = (int)(cx - halfW);
         int x1 = (int)(cx + halfW);
 
+        // Solid interior
         for (int x = std::max(0, x0); x <= std::min(width-1, x1); x++)
-            setPixel(x, y, color);
+            setPixel(x, y, color, canvas);
 
+        // Left fringe
         float leftFrac = (cx - halfW) - (float)x0;
         if (leftFrac > 0.0f)
             blendPixel(x0 - 1, y, color, leftFrac);
 
+        // Right fringe
         float rightFrac = (float)(x1 + 1) - (cx + halfW);
         if (rightFrac > 0.0f)
             blendPixel(x1 + 1, y, color, rightFrac);
@@ -184,8 +216,9 @@ void DrawingCanvas::drawThickLine(int x1, int y1, int x2, int y2) {
 
 void DrawingCanvas::floodFill(int x, int y) {
     if (x < 0 || x >= width || y < 0 || y >= height) return;
-    Uint32 target = getPixel(x, y);
-    Uint32 fill = eraserMode ? backgroundColor : currentColor;
+    // Flood fill works only on drawing layer
+    Uint32 target = getPixel(x, y, canvas);
+    Uint32 fill = eraserMode ? SDL_MapRGBA(canvas->format, 0,0,0,0) : currentColor;
     if (target == fill) return;
 
     pushState();
@@ -197,7 +230,7 @@ void DrawingCanvas::floodFill(int x, int y) {
 
     while (!queue.empty()) {
         SDL_Point p = queue.front(); queue.pop();
-        setPixel(p.x, p.y, fill);
+        setPixel(p.x, p.y, fill, canvas);
 
         for (int dx = -1; dx <= 1; dx++) {
             for (int dy = -1; dy <= 1; dy++) {
@@ -205,7 +238,7 @@ void DrawingCanvas::floodFill(int x, int y) {
                 if (dx != 0 && dy != 0) continue;
                 int nx = p.x + dx, ny = p.y + dy;
                 if (nx >= 0 && nx < width && ny >= 0 && ny < height && !visited[nx][ny]) {
-                    if (getPixel(nx, ny) == target) {
+                    if (getPixel(nx, ny, canvas) == target) {
                         visited[nx][ny] = true;
                         queue.push({nx, ny});
                     }
@@ -237,7 +270,7 @@ void DrawingCanvas::drawShapeRect(int x1, int y1, int x2, int y2) {
 void DrawingCanvas::drawShapeEllipse(int cx, int cy, int rx, int ry) {
     if (rx <= 0 || ry <= 0) return;
     pushState();
-    Uint32 color = eraserMode ? backgroundColor : currentColor;
+    Uint32 color = eraserMode ? SDL_MapRGBA(canvas->format, 0,0,0,0) : currentColor;
     int steps = 2 * (rx + ry);
     for (int i = 0; i <= steps; i++) {
         float angle = 2.0f * M_PI * i / steps;
@@ -265,31 +298,88 @@ void DrawingCanvas::redo() {
 }
 
 bool DrawingCanvas::save(const std::string& filename) {
-    return IMG_SavePNG(canvas, filename.c_str()) == 0;
+    // Composite background and drawing layer
+    SDL_Surface* composite = SDL_CreateRGBSurfaceWithFormat(0, width, height, 32, SDL_PIXELFORMAT_ARGB8888);
+    if (!composite) return false;
+
+    // Fill composite with background color if no background image
+    if (background) {
+        SDL_BlitSurface(background, nullptr, composite, nullptr);
+    } else {
+        SDL_FillRect(composite, nullptr, backgroundColor);
+    }
+    // Blend drawing layer over composite
+    SDL_BlitSurface(canvas, nullptr, composite, nullptr);
+
+    bool result = IMG_SavePNG(composite, filename.c_str()) == 0;
+    SDL_FreeSurface(composite);
+    return result;
 }
 
 bool DrawingCanvas::load(const std::string& filename) {
     SDL_Surface* img = IMG_Load(filename.c_str());
     if (!img) return false;
-    SDL_BlitScaled(img, nullptr, canvas, nullptr);
+
+    // Scale to canvas size
+    SDL_Surface* scaled = SDL_CreateRGBSurfaceWithFormat(0, width, height, 32, SDL_PIXELFORMAT_ARGB8888);
+    if (!scaled) {
+        SDL_FreeSurface(img);
+        return false;
+    }
+    SDL_BlitScaled(img, nullptr, scaled, nullptr);
     SDL_FreeSurface(img);
+
+    // Replace background (discard old)
+    if (background) SDL_FreeSurface(background);
+    background = scaled;
+
+    // Clear drawing layer to transparent
+    SDL_FillRect(canvas, nullptr, SDL_MapRGBA(canvas->format, 0,0,0,0));
+
+    // Reset undo/redo history
+    for (auto s : undoStack) SDL_FreeSurface(s);
+    for (auto s : redoStack) SDL_FreeSurface(s);
+    undoStack.clear();
+    redoStack.clear();
     pushState();
+
     return true;
 }
 
-Uint32 DrawingCanvas::getPixel(int x, int y) {
-    Uint32* pixels = (Uint32*)canvas->pixels;
-    return pixels[y * canvas->w + x];
+void DrawingCanvas::compositeToSurface(SDL_Surface* target) {
+    // Fill target with background (or background color if no background)
+    if (background) {
+        SDL_BlitSurface(background, nullptr, target, nullptr);
+    } else {
+        SDL_FillRect(target, nullptr, backgroundColor);
+    }
+    // Overlay drawing layer
+    SDL_BlitSurface(canvas, nullptr, target, nullptr);
+}
+
+Uint32 DrawingCanvas::getPixel(int x, int y, SDL_Surface* surf) {
+    Uint32* pixels = (Uint32*)surf->pixels;
+    return pixels[y * surf->w + x];
 }
 
 Uint32 DrawingCanvas::getPixelAt(int x, int y) {
     if (x < 0 || x >= width || y < 0 || y >= height) return 0;
-    return getPixel(x, y);
+    // Return composite pixel (background + drawing)
+    if (background) {
+        Uint32 bg = getPixel(x, y, background);
+        Uint32 fg = getPixel(x, y, canvas);
+        // Simple blend: if fg has alpha, we need to composite
+        // For simplicity, just return fg if opaque, else bg
+        if ((fg >> 24) == 0) return bg;
+        return fg;
+    } else {
+        return getPixel(x, y, canvas);
+    }
 }
 
-void DrawingCanvas::setPixel(int x, int y, Uint32 color) {
-    Uint32* pixels = (Uint32*)canvas->pixels;
-    pixels[y * canvas->w + x] = color;
+void DrawingCanvas::setPixel(int x, int y, Uint32 color, SDL_Surface* surf) {
+    Uint32* pixels = (Uint32*)surf->pixels;
+    pixels[y * surf->w + x] = color;
 }
 
 void DrawingCanvas::pushState() {

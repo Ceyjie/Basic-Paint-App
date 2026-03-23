@@ -203,6 +203,7 @@ void PiPaint::createToolbar() {
         {"Ellipse",  "shape_ellipse"},
         {"Undo",     "undo"},
         {"Redo",     "redo"},
+        {"New",      "new"},          // added
         {"Clear",    "clear"},
         {"Save",     "save"},
         {"Load",     "load"}
@@ -238,8 +239,15 @@ void PiPaint::createToolbar() {
 }
 
 void PiPaint::updateCanvasTexture() {
-    SDL_UpdateTexture(canvasTexture, nullptr, canvas.getSurface()->pixels, canvas.getSurface()->pitch);
+    // Create a temporary surface to composite background and drawing
+    SDL_Surface* composite = SDL_CreateRGBSurfaceWithFormat(0, width, height, 32, SDL_PIXELFORMAT_ARGB8888);
+    if (composite) {
+        canvas.compositeToSurface(composite);
+        SDL_UpdateTexture(canvasTexture, nullptr, composite->pixels, composite->pitch);
+        SDL_FreeSurface(composite);
+    }
 }
+
 
 void PiPaint::drawToolbar() {
     SDL_Rect toolbarBg = {0, 0, width, toolbarHeight};
@@ -309,9 +317,10 @@ void PiPaint::drawToolbar() {
             else if (btn.type == "bg") label = "Bg";
             else if (btn.type == "undo") label = "Undo";
             else if (btn.type == "redo") label = "Redo";
+            else if (btn.type == "new") label = "New";      // added
             else if (btn.type == "clear") label = "Clear";
             else if (btn.type == "save") label = "Save";
-            else if (btn.type == "load")          label = "Load";
+            else if (btn.type == "load") label = "Load";
             else if (btn.type == "shape_line")    label = "Line";
             else if (btn.type == "shape_rect")    label = "Rect";
             else if (btn.type == "shape_ellipse") label = "Ellipse";
