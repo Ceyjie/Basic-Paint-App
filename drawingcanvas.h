@@ -12,6 +12,8 @@ public:
     DrawingCanvas(int width, int height);
     ~DrawingCanvas();
 
+    void resetHistory();
+
     void clear();
     void setColor(Uint8 r, Uint8 g, Uint8 b);
     void setSize(int size);

@@ -204,8 +204,7 @@ void PiPaint::createToolbar() {
         {"Redo",     "redo"},
         {"Clear",    "clear"},
         {"Save",     "save"},
-        {"Load",     "load"},
-        {"Exit",     "exit"}
+        {"Load",     "load"}
     };
     for (auto& tb : textBtns) {
         Button btn;
@@ -315,7 +314,6 @@ void PiPaint::drawToolbar() {
             else if (btn.type == "shape_line")    label = "Line";
             else if (btn.type == "shape_rect")    label = "Rect";
             else if (btn.type == "shape_ellipse") label = "Ellipse";
-            else if (btn.type == "exit")          label = "Exit";
 
             Uint32 bg = COLOR_LIGHT_GRAY;
             if (btn.type == "eraser" && canvas.isEraserMode()) bg = _rgb(200, 220, 255);
@@ -644,7 +642,6 @@ void PiPaint::handleKeyboard(SDL_KeyboardEvent& ev) {
             executeToolAction("size_down");
         } else if (ev.keysym.sym == SDLK_ESCAPE) {
             if (showOverlay) showOverlay = false;
-            else exit(0);
         }
     }
 }
@@ -700,8 +697,6 @@ void PiPaint::executeToolAction(const std::string& type, int index) {
     } else if (type == "size_down") {
         penSize = std::max(1, penSize - 1);
         canvas.setSize(penSize);
-    } else if (type == "exit") {
-        exit(0);
     }
 }
 

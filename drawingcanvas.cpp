@@ -314,3 +314,11 @@ void DrawingCanvas::pushState() {
 void DrawingCanvas::restoreState(SDL_Surface* surf) {
     SDL_BlitSurface(surf, nullptr, canvas, nullptr);
 }
+
+void DrawingCanvas::resetHistory() {
+    for (auto s : undoStack) SDL_FreeSurface(s);
+    for (auto s : redoStack) SDL_FreeSurface(s);
+    undoStack.clear();
+    redoStack.clear();
+    pushState();
+}
