@@ -8,15 +8,136 @@
 #include <set>
 #include <vector>
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include "drawingcanvas.h"
 #include "touchhandler.h"
 
 namespace fs = std::filesystem;
 
-// Colors
+// ---------- forward declarations ----------
 static void hoverHighlight(SDL_Renderer* r, SDL_Rect rect, SDL_Point hover, SDL_Point tap, Uint32 tapTime, Uint32 flashMs);
 static const Uint32 TAP_FLASH_MS = 180;
+
+// ---------- helper functions (placed early so they are visible) ----------
+static void renderText(SDL_Renderer* r, TTF_Font* font, const std::string& text,
+                       SDL_Color col, int x, int y) {
+    if (text.empty()) return;
+    SDL_Surface* s = TTF_RenderUTF8_Blended(font, text.c_str(), col);
+    if (!s) return;
+    SDL_Texture* t = SDL_CreateTextureFromSurface(r, s);
+    SDL_Rect dst = {x, y, s->w, s->h};
+    SDL_RenderCopy(r, t, nullptr, &dst);
+    SDL_FreeSurface(s);
+    SDL_DestroyTexture(t);
+}
+
+static void fillRoundRect(SDL_Renderer* r, SDL_Rect rect, int radius,
+                           Uint8 R, Uint8 G, Uint8 B, Uint8 A) {
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, R, G, B, A);
+    SDL_Rect inner = {rect.x + radius, rect.y, rect.w - 2*radius, rect.h};
+    SDL_RenderFillRect(r, &inner);
+    SDL_Rect left  = {rect.x, rect.y + radius, radius, rect.h - 2*radius};
+    SDL_Rect right = {rect.x + rect.w - radius, rect.y + radius, radius, rect.h - 2*radius};
+    SDL_RenderFillRect(r, &left);
+    SDL_RenderFillRect(r, &right);
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+}
+
+static void drawScrollbar(SDL_Renderer* r, int x, int y, int h,
+                           int total, int visible, int& scroll,
+                           TTF_Font* font, SDL_Color dark) {
+    int btnH = 40;
+    bool canUp = (scroll > 0), canDown = (scroll < total - visible);
+    SDL_SetRenderDrawColor(r, canUp?210:238, canUp?210:238, canUp?215:240, 255);
+    { SDL_Rect _r={x,y,36,btnH}; SDL_RenderFillRect(r,&_r); }
+    SDL_SetRenderDrawColor(r,180,180,185,255);
+    { SDL_Rect _r={x,y,36,btnH}; SDL_RenderDrawRect(r,&_r); }
+    renderText(r, font, "^", dark, x+11, y+10);
+    int downY = y + h - btnH;
+    SDL_SetRenderDrawColor(r, canDown?210:238, canDown?210:238, canDown?215:240, 255);
+    { SDL_Rect _r={x,downY,36,btnH}; SDL_RenderFillRect(r,&_r); }
+    SDL_SetRenderDrawColor(r,180,180,185,255);
+    { SDL_Rect _r={x,downY,36,btnH}; SDL_RenderDrawRect(r,&_r); }
+    renderText(r, font, "v", dark, x+11, downY+10);
+    int trackY = y + btnH, trackH = h - btnH*2;
+    SDL_SetRenderDrawColor(r,225,225,230,255);
+    { SDL_Rect _r={x+10,trackY,16,trackH}; SDL_RenderFillRect(r,&_r); }
+    if (total > visible && trackH > 0) {
+        int thumbH = std::max(24, trackH * visible / total);
+        int thumbY = trackY + (trackH - thumbH) * scroll / (total - visible);
+        SDL_SetRenderDrawColor(r,160,160,170,255);
+        { SDL_Rect _r={x+10,thumbY,16,thumbH}; SDL_RenderFillRect(r,&_r); }
+    }
+}
+
+static void hoverHighlight(SDL_Renderer* r, SDL_Rect rect,
+                            SDL_Point hover, SDL_Point tap,
+                            Uint32 tapTime, Uint32 flashMs) {
+    Uint32 now = SDL_GetTicks();
+    bool isHover = (hover.x >= 0 &&
+                    hover.x >= rect.x && hover.x <= rect.x+rect.w &&
+                    hover.y >= rect.y && hover.y <= rect.y+rect.h);
+    bool isTap   = (tap.x >= 0 &&
+                    tap.x >= rect.x && tap.x <= rect.x+rect.w &&
+                    tap.y >= rect.y && tap.y <= rect.y+rect.h &&
+                    now - tapTime < flashMs);
+
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    if (isTap) {
+        float t = 1.0f - (float)(now - tapTime) / flashMs;
+        Uint8 alpha = (Uint8)(t * 220);
+        SDL_SetRenderDrawColor(r, 255, 255, 255, alpha);
+        SDL_RenderFillRect(r, &rect);
+    } else if (isHover) {
+        SDL_SetRenderDrawColor(r, 255, 160, 40, 60);
+        SDL_RenderFillRect(r, &rect);
+    }
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+}
+
+// ---------- colour helpers ----------
+static void rgbToHsv(Uint8 r, Uint8 g, Uint8 b, float &h, float &s, float &v) {
+    float rf = r / 255.0f, gf = g / 255.0f, bf = b / 255.0f;
+    float max = std::max({rf, gf, bf});
+    float min = std::min({rf, gf, bf});
+    v = max;
+    float delta = max - min;
+    if (delta < 0.0001f) {
+        h = 0; s = 0; return;
+    }
+    s = delta / max;
+    if (max == rf) h = (gf - bf) / delta;
+    else if (max == gf) h = 2.0f + (bf - rf) / delta;
+    else h = 4.0f + (rf - gf) / delta;
+    h *= 60.0f;
+    if (h < 0) h += 360.0f;
+    h /= 360.0f;
+}
+
+static void hsvToRgb(float h, float s, float v, Uint8 &r, Uint8 &g, Uint8 &b) {
+    float hh = h * 360.0f;
+    int i = (int)floor(hh / 60.0f) % 6;
+    float f = hh / 60.0f - floor(hh / 60.0f);
+    float p = v * (1.0f - s);
+    float q = v * (1.0f - f * s);
+    float t = v * (1.0f - (1.0f - f) * s);
+    float rr, gg, bb;
+    switch (i) {
+        case 0: rr = v; gg = t; bb = p; break;
+        case 1: rr = q; gg = v; bb = p; break;
+        case 2: rr = p; gg = v; bb = t; break;
+        case 3: rr = p; gg = q; bb = v; break;
+        case 4: rr = t; gg = p; bb = v; break;
+        default: rr = v; gg = p; bb = q; break;
+    }
+    r = (Uint8)(rr * 255);
+    g = (Uint8)(gg * 255);
+    b = (Uint8)(bb * 255);
+}
+
+// ---------- colour definitions ----------
 namespace {
     SDL_PixelFormat* _fmt = SDL_AllocFormat(SDL_PIXELFORMAT_ARGB8888);
     inline Uint32 _rgb(Uint8 r, Uint8 g, Uint8 b) { return SDL_MapRGB(_fmt, r, g, b); }
@@ -38,12 +159,14 @@ const Uint32 COLOR_TOOLBAR_BG = _rgb(240, 240, 245);
 const Uint32 COLOR_BORDER     = _rgb(180, 180, 185);
 const Uint32 COLOR_HIGHLIGHT  = _rgb(180, 200, 255);
 
+// ---------- Button structure ----------
 struct Button {
     SDL_Rect rect;
     std::string type;
     int index;
 };
 
+// ---------- PiPaint class definition ----------
 class PiPaint {
 public:
     PiPaint();
@@ -97,6 +220,14 @@ private:
     SDL_Point lastTapPos   = {-1, -1};
     Uint32    lastTapTime  = 0;
 
+    // Color wheel
+    SDL_Texture* colorWheelTexture = nullptr;
+    int wheelTexW = 0, wheelTexH = 0;
+    float currentHue = 0.0f, currentSat = 1.0f, currentVal = 1.0f;
+    void generateColorWheelTexture();
+    void showColorWheel();
+    void drawColorWheelOverlay();
+
     void createToolbar();
     void updateCanvasTexture();
     void drawToolbar();
@@ -133,6 +264,8 @@ private:
 
     void calibrate();
 };
+
+// ---------- PiPaint member function implementations ----------
 
 PiPaint::PiPaint() : canvas(1920, 1080), touch(1920, 1080) {
     SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
@@ -171,6 +304,7 @@ PiPaint::~PiPaint() {
     SDL_DestroyTexture(canvasTexture);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
+    if (colorWheelTexture) SDL_DestroyTexture(colorWheelTexture);
     TTF_Quit();
     IMG_Quit();
     SDL_Quit();
@@ -191,6 +325,13 @@ void PiPaint::createToolbar() {
         x += colorSize + margin;
     }
 
+    // Color wheel button
+    Button wheelBtn;
+    wheelBtn.rect = {x, y, colorSize, colorSize};
+    wheelBtn.type = "color_wheel";
+    toolbarButtons.push_back(wheelBtn);
+    x += colorSize + margin;
+
     int btnW = 60, btnH = 35;
     margin = 6;
     y = (toolbarHeight - btnH) / 2;
@@ -203,7 +344,7 @@ void PiPaint::createToolbar() {
         {"Ellipse",  "shape_ellipse"},
         {"Undo",     "undo"},
         {"Redo",     "redo"},
-        {"New",      "new"},          // added
+        {"New",      "new"},
         {"Clear",    "clear"},
         {"Save",     "save"},
         {"Load",     "load"}
@@ -239,7 +380,6 @@ void PiPaint::createToolbar() {
 }
 
 void PiPaint::updateCanvasTexture() {
-    // Create a temporary surface to composite background and drawing
     SDL_Surface* composite = SDL_CreateRGBSurfaceWithFormat(0, width, height, 32, SDL_PIXELFORMAT_ARGB8888);
     if (composite) {
         canvas.compositeToSurface(composite);
@@ -247,7 +387,6 @@ void PiPaint::updateCanvasTexture() {
         SDL_FreeSurface(composite);
     }
 }
-
 
 void PiPaint::drawToolbar() {
     SDL_Rect toolbarBg = {0, 0, width, toolbarHeight};
@@ -279,6 +418,25 @@ void PiPaint::drawToolbar() {
                 SDL_Rect highlight = {btn.rect.x-3, btn.rect.y-3, btn.rect.w+6, btn.rect.h+6};
                 SDL_SetRenderDrawColor(renderer, 0, 122, 255, 255);
                 SDL_RenderDrawRect(renderer, &highlight);
+            }
+            hoverHighlight(renderer, btn.rect, lastTouchPos, lastTapPos, lastTapTime, TAP_FLASH_MS);
+        } else if (btn.type == "color_wheel") {
+            SDL_SetRenderDrawColor(renderer, 255,255,255,255);
+            SDL_RenderFillRect(renderer, &btn.rect);
+            SDL_SetRenderDrawColor(renderer, 44,44,46,255);
+            SDL_RenderDrawRect(renderer, &btn.rect);
+            int cx = btn.rect.x + btn.rect.w/2;
+            int cy = btn.rect.y + btn.rect.h/2;
+            int r = btn.rect.w/2 - 2;
+            for (int i = 0; i < 360; i++) {
+                float rad = i * M_PI / 180.0f;
+                int x1 = cx + r * cos(rad);
+                int y1 = cy + r * sin(rad);
+                SDL_SetRenderDrawColor(renderer, 
+                    (int)((sin(rad)+1)/2*255), 
+                    (int)((sin(rad+2.094)+1)/2*255), 
+                    (int)((sin(rad+4.188)+1)/2*255), 255);
+                SDL_RenderDrawPoint(renderer, x1, y1);
             }
             hoverHighlight(renderer, btn.rect, lastTouchPos, lastTapPos, lastTapTime, TAP_FLASH_MS);
         } else if (btn.type == "size_label") {
@@ -317,7 +475,7 @@ void PiPaint::drawToolbar() {
             else if (btn.type == "bg") label = "Bg";
             else if (btn.type == "undo") label = "Undo";
             else if (btn.type == "redo") label = "Redo";
-            else if (btn.type == "new") label = "New";      // added
+            else if (btn.type == "new") label = "New";
             else if (btn.type == "clear") label = "Clear";
             else if (btn.type == "save") label = "Save";
             else if (btn.type == "load") label = "Load";
@@ -354,8 +512,48 @@ void PiPaint::handleTouchDown(int fingerId, int x, int y) {
     lastTapPos   = {x, y};
     lastTapTime  = SDL_GetTicks();
 
-    // --- overlay intercepts all touches ---
     if (showOverlay) {
+        if (overlayType == "color_wheel") {
+            int wheelSize = 400;
+            int sliderW = 60;
+            int totalW = wheelSize + sliderW + 40;
+            int panelX = (width - totalW) / 2;
+            int panelY = (height - wheelSize) / 2;
+
+            int cx = panelX + wheelSize/2;
+            int cy = panelY + wheelSize/2;
+            int dx = x - cx, dy = y - cy;
+            float dist = sqrt(dx*dx + dy*dy);
+            if (dist <= wheelSize/2) {
+                float angle = atan2(dy, dx);
+                currentHue = (angle + M_PI) / (2*M_PI);
+                currentSat = std::min(1.0f, dist / (wheelSize/2));
+                if (currentSat < 0) currentSat = 0;
+                Uint8 r, g, b;
+                hsvToRgb(currentHue, currentSat, currentVal, r, g, b);
+                canvas.setColor(r, g, b);
+                return;
+            }
+            int sliderX = panelX + wheelSize + 20;
+            if (x >= sliderX && x <= sliderX+sliderW && y >= panelY && y <= panelY+wheelSize) {
+                currentVal = 1.0f - (float)(y - panelY) / wheelSize;
+                if (currentVal < 0) currentVal = 0;
+                if (currentVal > 1) currentVal = 1;
+                Uint8 r, g, b;
+                hsvToRgb(currentHue, currentSat, currentVal, r, g, b);
+                canvas.setColor(r, g, b);
+                return;
+            }
+            int btnW = 100, btnH = 48;
+            int btnX = (width - btnW) / 2;
+            int btnY = panelY + wheelSize + 20;
+            if (x >= btnX && x <= btnX+btnW && y >= btnY && y <= btnY+btnH) {
+                showOverlay = false;
+                return;
+            }
+            return;
+        }
+
         bool isSave = (overlayType == "save");
 
         const int PAD   = 20;
@@ -559,7 +757,6 @@ void PiPaint::handleMouseButtonUp(SDL_MouseButtonEvent& ev) {
 
 void PiPaint::handleKeyboard(SDL_KeyboardEvent& ev) {
     if (ev.type == SDL_KEYDOWN) {
-        // Overlay keyboard handling
         if (showOverlay && overlayType == "save" && !browsingFolder) {
             if (ev.keysym.sym == SDL_SCANCODE_TO_KEYCODE(SDL_SCANCODE_RETURN) ||
                 ev.keysym.sym == SDLK_KP_ENTER) {
@@ -618,6 +815,10 @@ void PiPaint::handleKeyboard(SDL_KeyboardEvent& ev) {
             if (ev.keysym.sym == SDLK_RETURN) { selectCurrentFolder(); return; }
             return;
         }
+        if (showOverlay && overlayType == "color_wheel") {
+            if (ev.keysym.sym == SDLK_ESCAPE) { showOverlay = false; return; }
+            return;
+        }
 
         if (ev.keysym.sym >= SDLK_1 && ev.keysym.sym <= SDLK_9) {
             int idx = ev.keysym.sym - SDLK_1;
@@ -648,7 +849,6 @@ void PiPaint::handleKeyboard(SDL_KeyboardEvent& ev) {
             executeToolAction("size_down");
         } else if (ev.keysym.sym == SDLK_ESCAPE) {
             if (showOverlay) showOverlay = false;
-            // No application exit
         }
     }
 }
@@ -667,6 +867,8 @@ void PiPaint::executeToolAction(const std::string& type, int index) {
             case 8: canvas.setColor(90,200,250); break;
             case 9: canvas.setColor(255,255,255); break;
         }
+    } else if (type == "color_wheel") {
+        showColorWheel();
     } else if (type == "eraser") {
         canvas.toggleEraser();
         shapeMode = ShapeMode::NONE;
@@ -716,34 +918,103 @@ void PiPaint::newCanvas() {
     shapeOwnerFinger = -1;
 }
 
-// ---------- helpers ----------
-
-static void renderText(SDL_Renderer* r, TTF_Font* font, const std::string& text,
-                       SDL_Color col, int x, int y) {
-    if (text.empty()) return;
-    SDL_Surface* s = TTF_RenderUTF8_Blended(font, text.c_str(), col);
-    if (!s) return;
-    SDL_Texture* t = SDL_CreateTextureFromSurface(r, s);
-    SDL_Rect dst = {x, y, s->w, s->h};
-    SDL_RenderCopy(r, t, nullptr, &dst);
-    SDL_FreeSurface(s);
-    SDL_DestroyTexture(t);
+void PiPaint::showColorWheel() {
+    overlayType = "color_wheel";
+    showOverlay = true;
+    browsingFolder = false;
+    Uint32 col = canvas.getCurrentColor();
+    Uint8 r = (col >> 16) & 0xFF;
+    Uint8 g = (col >> 8) & 0xFF;
+    Uint8 b = col & 0xFF;
+    rgbToHsv(r, g, b, currentHue, currentSat, currentVal);
+    if (colorWheelTexture == nullptr) generateColorWheelTexture();
 }
 
-static void fillRoundRect(SDL_Renderer* r, SDL_Rect rect, int radius,
-                           Uint8 R, Uint8 G, Uint8 B, Uint8 A) {
-    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(r, R, G, B, A);
-    SDL_Rect inner = {rect.x + radius, rect.y, rect.w - 2*radius, rect.h};
-    SDL_RenderFillRect(r, &inner);
-    SDL_Rect left  = {rect.x, rect.y + radius, radius, rect.h - 2*radius};
-    SDL_Rect right = {rect.x + rect.w - radius, rect.y + radius, radius, rect.h - 2*radius};
-    SDL_RenderFillRect(r, &left);
-    SDL_RenderFillRect(r, &right);
-    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+void PiPaint::generateColorWheelTexture() {
+    if (colorWheelTexture) SDL_DestroyTexture(colorWheelTexture);
+    int size = 400;
+    wheelTexW = wheelTexH = size;
+    SDL_Surface* surf = SDL_CreateRGBSurfaceWithFormat(0, size, size, 32, SDL_PIXELFORMAT_ARGB8888);
+    if (!surf) return;
+    int cx = size/2, cy = size/2;
+    int r = size/2 - 2;
+    for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+            int dx = x - cx, dy = y - cy;
+            float dist = sqrt(dx*dx + dy*dy);
+            if (dist > r) {
+                ((Uint32*)surf->pixels)[y*size + x] = 0x00000000;
+                continue;
+            }
+            float angle = atan2(dy, dx);
+            float hue = (angle + M_PI) / (2*M_PI);
+            float sat = dist / r;
+            Uint8 rr, gg, bb;
+            hsvToRgb(hue, sat, 1.0f, rr, gg, bb);
+            ((Uint32*)surf->pixels)[y*size + x] = SDL_MapRGB(surf->format, rr, gg, bb);
+        }
+    }
+    colorWheelTexture = SDL_CreateTextureFromSurface(renderer, surf);
+    SDL_FreeSurface(surf);
 }
 
-// ---------- file list ----------
+void PiPaint::drawColorWheelOverlay() {
+    int wheelSize = 400;
+    int sliderW = 60;
+    int previewW = 100;
+    int totalW = wheelSize + sliderW + 40;
+    int totalH = wheelSize;
+    int panelX = (width - totalW) / 2;
+    int panelY = (height - totalH) / 2;
+
+    SDL_Rect wheelRect = {panelX, panelY, wheelSize, wheelSize};
+    SDL_RenderCopy(renderer, colorWheelTexture, nullptr, &wheelRect);
+
+    int sliderX = panelX + wheelSize + 20;
+    SDL_Rect sliderRect = {sliderX, panelY, sliderW, wheelSize};
+    SDL_SetRenderDrawColor(renderer, 200,200,200,255);
+    SDL_RenderFillRect(renderer, &sliderRect);
+    for (int y = 0; y < wheelSize; y++) {
+        float v = 1.0f - (float)y / wheelSize;
+        Uint8 gray = (Uint8)(v * 255);
+        SDL_SetRenderDrawColor(renderer, gray, gray, gray, 255);
+        SDL_RenderDrawLine(renderer, sliderX, panelY+y, sliderX+sliderW-1, panelY+y);
+    }
+
+    float angle = currentHue * 2 * M_PI;
+    float dist = currentSat * (wheelSize/2 - 2);
+    int cx = panelX + wheelSize/2;
+    int cy = panelY + wheelSize/2;
+    int mx = cx + dist * cos(angle);
+    int my = cy + dist * sin(angle);
+    SDL_SetRenderDrawColor(renderer, 255,255,255,255);
+    SDL_RenderDrawLine(renderer, mx-5, my, mx+5, my);
+    SDL_RenderDrawLine(renderer, mx, my-5, mx, my+5);
+
+    int sliderY = panelY + (1.0f - currentVal) * wheelSize;
+    SDL_SetRenderDrawColor(renderer, 0,0,0,255);
+    SDL_RenderDrawLine(renderer, sliderX-5, sliderY, sliderX+sliderW+5, sliderY);
+
+    Uint8 pr, pg, pb;
+    hsvToRgb(currentHue, currentSat, currentVal, pr, pg, pb);
+    SDL_Rect preview = {sliderX + sliderW + 10, panelY + wheelSize - 50, previewW, 40};
+    SDL_SetRenderDrawColor(renderer, pr, pg, pb, 255);
+    SDL_RenderFillRect(renderer, &preview);
+    SDL_SetRenderDrawColor(renderer, 44,44,46,255);
+    SDL_RenderDrawRect(renderer, &preview);
+
+    int btnW = 100, btnH = 48;
+    int btnX = (width - btnW) / 2;
+    int btnY = panelY + wheelSize + 20;
+    SDL_SetRenderDrawColor(renderer, 232,232,236,255);
+    SDL_Rect closeBtn = {btnX, btnY, btnW, btnH};
+    SDL_RenderFillRect(renderer, &closeBtn);
+    SDL_SetRenderDrawColor(renderer, 180,180,185,255);
+    SDL_RenderDrawRect(renderer, &closeBtn);
+    renderText(renderer, fontSmall, "Close", {44,44,46,255}, btnX+30, btnY+12);
+}
+
+// ---------- file list helpers ----------
 
 void PiPaint::refreshFileList() {
     overlayFiles.clear();
@@ -777,8 +1048,6 @@ std::string PiPaint::generateRandomFilename() {
     return "drawing_" + std::to_string(time(nullptr)) + ".png";
 }
 
-// ---------- show overlays ----------
-
 void PiPaint::showSaveOverlay() {
     overlayType = "save";
     showOverlay = true;
@@ -798,8 +1067,6 @@ void PiPaint::showLoadOverlay() {
     refreshFileList();
     refreshSubdirs();
 }
-
-// ---------- save / load ----------
 
 void PiPaint::saveCurrentDrawing() {
     std::string name = filenameInput.empty() ? generateRandomFilename() : filenameInput;
@@ -822,8 +1089,6 @@ void PiPaint::loadSelectedDrawing() {
         std::cerr << "Load failed: " << path << "\n";
     showOverlay = false;
 }
-
-// ---------- folder browser ----------
 
 void PiPaint::enterFolderBrowser() {
     browsingFolder = true;
@@ -1043,62 +1308,6 @@ bool PiPaint::handleVKTap(int tx, int ty, int kbX, int kbY, int kbW) {
     return false;
 }
 
-// ---------- hover / tap highlight ----------
-
-static void hoverHighlight(SDL_Renderer* r, SDL_Rect rect,
-                            SDL_Point hover, SDL_Point tap,
-                            Uint32 tapTime, Uint32 flashMs) {
-    Uint32 now = SDL_GetTicks();
-    bool isHover = (hover.x >= 0 &&
-                    hover.x >= rect.x && hover.x <= rect.x+rect.w &&
-                    hover.y >= rect.y && hover.y <= rect.y+rect.h);
-    bool isTap   = (tap.x >= 0 &&
-                    tap.x >= rect.x && tap.x <= rect.x+rect.w &&
-                    tap.y >= rect.y && tap.y <= rect.y+rect.h &&
-                    now - tapTime < flashMs);
-
-    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
-    if (isTap) {
-        float t = 1.0f - (float)(now - tapTime) / flashMs;
-        Uint8 alpha = (Uint8)(t * 220);
-        SDL_SetRenderDrawColor(r, 255, 255, 255, alpha);
-        SDL_RenderFillRect(r, &rect);
-    } else if (isHover) {
-        SDL_SetRenderDrawColor(r, 255, 160, 40, 60);
-        SDL_RenderFillRect(r, &rect);
-    }
-    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
-}
-
-// ---------- scrollbar ----------
-
-static void drawScrollbar(SDL_Renderer* r, int x, int y, int h,
-                           int total, int visible, int& scroll,
-                           TTF_Font* font, SDL_Color dark) {
-    int btnH = 40;
-    bool canUp = (scroll > 0), canDown = (scroll < total - visible);
-    SDL_SetRenderDrawColor(r, canUp?210:238, canUp?210:238, canUp?215:240, 255);
-    { SDL_Rect _r={x,y,36,btnH}; SDL_RenderFillRect(r,&_r); }
-    SDL_SetRenderDrawColor(r,180,180,185,255);
-    { SDL_Rect _r={x,y,36,btnH}; SDL_RenderDrawRect(r,&_r); }
-    renderText(r, font, "^", dark, x+11, y+10);
-    int downY = y + h - btnH;
-    SDL_SetRenderDrawColor(r, canDown?210:238, canDown?210:238, canDown?215:240, 255);
-    { SDL_Rect _r={x,downY,36,btnH}; SDL_RenderFillRect(r,&_r); }
-    SDL_SetRenderDrawColor(r,180,180,185,255);
-    { SDL_Rect _r={x,downY,36,btnH}; SDL_RenderDrawRect(r,&_r); }
-    renderText(r, font, "v", dark, x+11, downY+10);
-    int trackY = y + btnH, trackH = h - btnH*2;
-    SDL_SetRenderDrawColor(r,225,225,230,255);
-    { SDL_Rect _r={x+10,trackY,16,trackH}; SDL_RenderFillRect(r,&_r); }
-    if (total > visible && trackH > 0) {
-        int thumbH = std::max(24, trackH * visible / total);
-        int thumbY = trackY + (trackH - thumbH) * scroll / (total - visible);
-        SDL_SetRenderDrawColor(r,160,160,170,255);
-        { SDL_Rect _r={x+10,thumbY,16,thumbH}; SDL_RenderFillRect(r,&_r); }
-    }
-}
-
 // ---------- drawOverlay ----------
 
 void PiPaint::drawOverlay() {
@@ -1106,6 +1315,11 @@ void PiPaint::drawOverlay() {
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 170);
     { SDL_Rect _r={0,0,width,height}; SDL_RenderFillRect(renderer,&_r); }
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+
+    if (overlayType == "color_wheel") {
+        drawColorWheelOverlay();
+        return;
+    }
 
     bool isSave = (overlayType == "save");
 

@@ -77,9 +77,7 @@ void DrawingCanvas::toggleBackground() {
     backgroundColor = (oldBg == SDL_MapRGB(canvas->format, 255,255,255)) ?
                        SDL_MapRGB(canvas->format, 0,0,0) :
                        SDL_MapRGB(canvas->format, 255,255,255);
-    // We need to change all non‑transparent pixels on the drawing layer
-    // to their inverted color relative to the new background? Wait, the old toggleBackground
-    // used to invert non‑background pixels. That was a feature. We keep that, but only on the canvas.
+    // Invert all non‑transparent pixels on the drawing layer
     Uint32* pixels = (Uint32*)canvas->pixels;
     int totalPixels = width * height;
     for (int i = 0; i < totalPixels; i++) {
