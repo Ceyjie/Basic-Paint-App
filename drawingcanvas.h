@@ -76,7 +76,7 @@ private:
     std::map<int, StrokeBuffer> strokeBuffers;
     std::deque<SDL_Surface*> undoStack;
     std::deque<SDL_Surface*> redoStack;
-    int maxUndo = 20;
+    int maxUndo = 100;
 
     SDL_Rect dirtyRect;
     static constexpr int DIRTY_MARGIN = 50;

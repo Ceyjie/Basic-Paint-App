@@ -147,6 +147,7 @@ void DrawingCanvas::startStroke(int x, int y, int fingerId) {
     buf.needsFlush = false;
 
     activeStrokes[fingerId] = {x, y};
+    pushState();
     drawPoint(x, y);
 }
 
@@ -192,7 +193,6 @@ void DrawingCanvas::endStroke(int fingerId) {
     strokeBuffers[fingerId].smoothedPoints.clear();
 
     if (activeStrokes.erase(fingerId) > 0) {
-        pushState();
         dirtyRect = {-1, 0, 0, 0};
     }
 }
@@ -349,7 +349,6 @@ void DrawingCanvas::floodFill(int x, int y) {
 void DrawingCanvas::drawShapeLine(int x1, int y1, int x2, int y2) {
     pushState();
     drawThickLine(x1, y1, x2, y2);
-    pushState();
 }
 
 void DrawingCanvas::drawShapeRect(int x1, int y1, int x2, int y2) {
@@ -362,7 +361,6 @@ void DrawingCanvas::drawShapeRect(int x1, int y1, int x2, int y2) {
     drawThickLine(right, top,    right, bottom);
     drawThickLine(right, bottom, left,  bottom);
     drawThickLine(left,  bottom, left,  top);
-    pushState();
 }
 
 void DrawingCanvas::drawShapeEllipse(int cx, int cy, int rx, int ry) {
@@ -376,15 +374,18 @@ void DrawingCanvas::drawShapeEllipse(int cx, int cy, int rx, int ry) {
         int py = cy + (int)(ry * sinf(angle));
         drawCircleAA(px, py, penSize, color);
     }
-    pushState();
 }
 
 void DrawingCanvas::undo() {
+    fprintf(stderr, "DEBUG undo: undoStack size = %zu, redoStack size = %zu\n", undoStack.size(), redoStack.size());
     if (undoStack.size() > 1) {
         redoStack.push_front(undoStack.front());
         undoStack.pop_front();
         restoreState(undoStack.front());
         dirtyRect = {-1, 0, 0, 0};
+        fprintf(stderr, "DEBUG undo: UNDONE! undoStack now = %zu, redoStack now = %zu\n", undoStack.size(), redoStack.size());
+    } else {
+        fprintf(stderr, "DEBUG undo: CANNOT UNDO (size <= 1)\n");
     }
 }
 
@@ -493,7 +494,9 @@ void DrawingCanvas::setPixel(int x, int y, Uint32 color, SDL_Surface* surf) {
 
 void DrawingCanvas::pushState() {
     SDL_Surface* copy = SDL_ConvertSurface(canvas, canvas->format, 0);
+    fprintf(stderr, "DEBUG pushState: undoStack size BEFORE = %zu\n", undoStack.size());
     undoStack.push_front(copy);
+    fprintf(stderr, "DEBUG pushState: undoStack size AFTER = %zu, maxUndo = %d\n", undoStack.size(), maxUndo);
     if (undoStack.size() > maxUndo) {
         SDL_FreeSurface(undoStack.back());
         undoStack.pop_back();
