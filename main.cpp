@@ -227,6 +227,7 @@ private:
     void generateColorWheelTexture();
     void showColorWheel();
     void drawColorWheelOverlay();
+    bool handleColorWheelClick(int x, int y);
 
     void createToolbar();
     void updateCanvasTexture();
@@ -288,6 +289,7 @@ PiPaint::PiPaint() : canvas(1920, 1080), touch(1920, 1080) {
     if (!fontSmall) fontSmall = TTF_OpenFont("DejaVuSans.ttf", 20);
 
     touch.init();
+    touch.startInputThread();
     createToolbar();
 
     system("mkdir -p ~/pi-paint/drawings");
@@ -297,6 +299,7 @@ PiPaint::PiPaint() : canvas(1920, 1080), touch(1920, 1080) {
 }
 
 PiPaint::~PiPaint() {
+    touch.stopInputThread();
     TTF_CloseFont(fontTiny);
     TTF_CloseFont(fontSmall);
     TTF_CloseFont(fontMedium);
@@ -386,6 +389,7 @@ void PiPaint::updateCanvasTexture() {
         SDL_UpdateTexture(canvasTexture, nullptr, composite->pixels, composite->pitch);
         SDL_FreeSurface(composite);
     }
+    canvas.clearDirtyRect();
 }
 
 void PiPaint::drawToolbar() {
@@ -514,43 +518,7 @@ void PiPaint::handleTouchDown(int fingerId, int x, int y) {
 
     if (showOverlay) {
         if (overlayType == "color_wheel") {
-            int wheelSize = 400;
-            int sliderW = 60;
-            int totalW = wheelSize + sliderW + 40;
-            int panelX = (width - totalW) / 2;
-            int panelY = (height - wheelSize) / 2;
-
-            int cx = panelX + wheelSize/2;
-            int cy = panelY + wheelSize/2;
-            int dx = x - cx, dy = y - cy;
-            float dist = sqrt(dx*dx + dy*dy);
-            if (dist <= wheelSize/2) {
-                float angle = atan2(dy, dx);
-                currentHue = (angle + M_PI) / (2*M_PI);
-                currentSat = std::min(1.0f, dist / (wheelSize/2));
-                if (currentSat < 0) currentSat = 0;
-                Uint8 r, g, b;
-                hsvToRgb(currentHue, currentSat, currentVal, r, g, b);
-                canvas.setColor(r, g, b);
-                return;
-            }
-            int sliderX = panelX + wheelSize + 20;
-            if (x >= sliderX && x <= sliderX+sliderW && y >= panelY && y <= panelY+wheelSize) {
-                currentVal = 1.0f - (float)(y - panelY) / wheelSize;
-                if (currentVal < 0) currentVal = 0;
-                if (currentVal > 1) currentVal = 1;
-                Uint8 r, g, b;
-                hsvToRgb(currentHue, currentSat, currentVal, r, g, b);
-                canvas.setColor(r, g, b);
-                return;
-            }
-            int btnW = 100, btnH = 48;
-            int btnX = (width - btnW) / 2;
-            int btnY = panelY + wheelSize + 20;
-            if (x >= btnX && x <= btnX+btnW && y >= btnY && y <= btnY+btnH) {
-                showOverlay = false;
-                return;
-            }
+            if (handleColorWheelClick(x, y)) return;
             return;
         }
 
@@ -932,26 +900,18 @@ void PiPaint::showColorWheel() {
 
 void PiPaint::generateColorWheelTexture() {
     if (colorWheelTexture) SDL_DestroyTexture(colorWheelTexture);
-    int size = 400;
+    int size = 320;
     wheelTexW = wheelTexH = size;
     SDL_Surface* surf = SDL_CreateRGBSurfaceWithFormat(0, size, size, 32, SDL_PIXELFORMAT_ARGB8888);
     if (!surf) return;
-    int cx = size/2, cy = size/2;
-    int r = size/2 - 2;
+    
     for (int y = 0; y < size; y++) {
         for (int x = 0; x < size; x++) {
-            int dx = x - cx, dy = y - cy;
-            float dist = sqrt(dx*dx + dy*dy);
-            if (dist > r) {
-                ((Uint32*)surf->pixels)[y*size + x] = 0x00000000;
-                continue;
-            }
-            float angle = atan2(dy, dx);
-            float hue = (angle + M_PI) / (2*M_PI);
-            float sat = dist / r;
+            float sat = (float)x / size;
+            float val = 1.0f - (float)y / size;
             Uint8 rr, gg, bb;
-            hsvToRgb(hue, sat, 1.0f, rr, gg, bb);
-            ((Uint32*)surf->pixels)[y*size + x] = SDL_MapRGB(surf->format, rr, gg, bb);
+            hsvToRgb(currentHue, sat, val, rr, gg, bb);
+            ((Uint32*)surf->pixels)[y*size + x] = SDL_MapRGBA(surf->format, rr, gg, bb, 255);
         }
     }
     colorWheelTexture = SDL_CreateTextureFromSurface(renderer, surf);
@@ -959,59 +919,147 @@ void PiPaint::generateColorWheelTexture() {
 }
 
 void PiPaint::drawColorWheelOverlay() {
-    int wheelSize = 400;
-    int sliderW = 60;
-    int previewW = 100;
-    int totalW = wheelSize + sliderW + 40;
-    int totalH = wheelSize;
-    int panelX = (width - totalW) / 2;
-    int panelY = (height - totalH) / 2;
+    const int MARGIN = 30;
+    const int hueH = 30;
+    const int pickerSize = 280;
+    const int previewH = 40;
+    const int panelW = pickerSize + MARGIN * 2;
+    const int panelH = 40 + hueH + 10 + pickerSize + 10 + previewH + 50;
+    const int panelX = (width - panelW) / 2;
+    const int panelY = (height - panelH) / 2;
 
-    SDL_Rect wheelRect = {panelX, panelY, wheelSize, wheelSize};
-    SDL_RenderCopy(renderer, colorWheelTexture, nullptr, &wheelRect);
+    SDL_SetRenderDrawColor(renderer, 250, 250, 255, 255);
+    SDL_Rect panel = {panelX, panelY, panelW, panelH};
+    SDL_RenderFillRect(renderer, &panel);
+    SDL_SetRenderDrawColor(renderer, 180, 180, 185, 255);
+    SDL_RenderDrawRect(renderer, &panel);
 
-    int sliderX = panelX + wheelSize + 20;
-    SDL_Rect sliderRect = {sliderX, panelY, sliderW, wheelSize};
-    SDL_SetRenderDrawColor(renderer, 200,200,200,255);
-    SDL_RenderFillRect(renderer, &sliderRect);
-    for (int y = 0; y < wheelSize; y++) {
-        float v = 1.0f - (float)y / wheelSize;
-        Uint8 gray = (Uint8)(v * 255);
-        SDL_SetRenderDrawColor(renderer, gray, gray, gray, 255);
-        SDL_RenderDrawLine(renderer, sliderX, panelY+y, sliderX+sliderW-1, panelY+y);
+    int contentX = panelX + MARGIN;
+    int titleY = panelY + 15;
+    renderText(renderer, fontMedium, "Color", {44, 44, 46, 255}, contentX, titleY);
+
+    int hueY = panelY + 50;
+    SDL_Rect hueRect = {contentX, hueY, pickerSize, hueH};
+    for (int i = 0; i < pickerSize; i++) {
+        float hue = (float)i / pickerSize;
+        Uint8 r, g, b;
+        hsvToRgb(hue, 1.0f, 1.0f, r, g, b);
+        SDL_SetRenderDrawColor(renderer, r, g, b, 255);
+        SDL_RenderDrawLine(renderer, contentX + i, hueY, contentX + i, hueY + hueH);
+    }
+    SDL_SetRenderDrawColor(renderer, 100, 100, 105, 255);
+    SDL_RenderDrawRect(renderer, &hueRect);
+
+    int hueMarkerX = contentX + currentHue * pickerSize;
+    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+    SDL_RenderDrawLine(renderer, hueMarkerX, hueY - 2, hueMarkerX, hueY + hueH + 2);
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+    SDL_RenderDrawLine(renderer, hueMarkerX - 1, hueY - 2, hueMarkerX - 1, hueY + hueH + 2);
+    SDL_RenderDrawLine(renderer, hueMarkerX + 1, hueY - 2, hueMarkerX + 1, hueY + hueH + 2);
+
+    generateColorWheelTexture();
+    int pickerY = hueY + hueH + 10;
+    SDL_Rect pickerRect = {contentX, pickerY, pickerSize, pickerSize};
+    SDL_RenderCopy(renderer, colorWheelTexture, nullptr, &pickerRect);
+    SDL_SetRenderDrawColor(renderer, 100, 100, 105, 255);
+    SDL_RenderDrawRect(renderer, &pickerRect);
+
+    int markerX = contentX + currentSat * pickerSize;
+    int markerY = pickerY + (1.0f - currentVal) * pickerSize;
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+    SDL_Rect marker = {markerX - 5, markerY - 5, 10, 10};
+    SDL_RenderDrawRect(renderer, &marker);
+
+    int previewY = pickerY + pickerSize + 10;
+    Uint8 cr, cg, cb;
+    hsvToRgb(currentHue, currentSat, currentVal, cr, cg, cb);
+    
+    SDL_Rect currentPrev = {contentX, previewY, 60, 25};
+    SDL_SetRenderDrawColor(renderer, cr, cg, cb, 255);
+    SDL_RenderFillRect(renderer, &currentPrev);
+    SDL_SetRenderDrawColor(renderer, 150, 150, 155, 255);
+    SDL_RenderDrawRect(renderer, &currentPrev);
+
+    char rgbText[32];
+    snprintf(rgbText, sizeof(rgbText), "R:%d G:%d B:%d", cr, cg, cb);
+    renderText(renderer, fontSmall, rgbText, {60, 60, 65, 255}, contentX + 70, previewY + 5);
+
+    int btnW = 100, btnH = 40;
+    int btnY = previewY + 35;
+    int btnGap = 20;
+    int cancelX = panelX + MARGIN;
+    int okX = panelX + panelW - MARGIN - btnW;
+
+    SDL_SetRenderDrawColor(renderer, 210, 210, 215, 255);
+    SDL_Rect cancelBtn = {cancelX, btnY, btnW, btnH};
+    SDL_RenderFillRect(renderer, &cancelBtn);
+    SDL_SetRenderDrawColor(renderer, 160, 160, 165, 255);
+    SDL_RenderDrawRect(renderer, &cancelBtn);
+    hoverHighlight(renderer, cancelBtn, lastTouchPos, lastTapPos, lastTapTime, TAP_FLASH_MS);
+    renderText(renderer, fontSmall, "Cancel", {60, 60, 65, 255}, cancelX + 28, btnY + 10);
+
+    SDL_SetRenderDrawColor(renderer, 0, 180, 100, 255);
+    SDL_Rect okBtn = {okX, btnY, btnW, btnH};
+    SDL_RenderFillRect(renderer, &okBtn);
+    SDL_SetRenderDrawColor(renderer, 0, 140, 80, 255);
+    SDL_RenderDrawRect(renderer, &okBtn);
+    hoverHighlight(renderer, okBtn, lastTouchPos, lastTapPos, lastTapTime, TAP_FLASH_MS);
+    renderText(renderer, fontSmall, "OK", {255, 255, 255, 255}, okX + 40, btnY + 10);
+}
+
+bool PiPaint::handleColorWheelClick(int x, int y) {
+    const int MARGIN = 30;
+    const int hueH = 30;
+    const int pickerSize = 280;
+    const int previewH = 40;
+    const int panelW = pickerSize + MARGIN * 2;
+    const int panelH = 40 + hueH + 10 + pickerSize + 10 + previewH + 50;
+    const int panelX = (width - panelW) / 2;
+    const int panelY = (height - panelH) / 2;
+
+    if (x < panelX || x > panelX + panelW || y < panelY || y > panelY + panelH) return false;
+
+    int contentX = panelX + MARGIN;
+    int hueY = panelY + 50;
+
+    if (y >= hueY && y <= hueY + hueH && x >= contentX && x <= contentX + pickerSize) {
+        currentHue = (float)(x - contentX) / pickerSize;
+        currentHue = std::max(0.0f, std::min(1.0f, currentHue));
+        Uint8 r, g, b;
+        hsvToRgb(currentHue, currentSat, currentVal, r, g, b);
+        canvas.setColor(r, g, b);
+        return true;
     }
 
-    float angle = currentHue * 2 * M_PI;
-    float dist = currentSat * (wheelSize/2 - 2);
-    int cx = panelX + wheelSize/2;
-    int cy = panelY + wheelSize/2;
-    int mx = cx + dist * cos(angle);
-    int my = cy + dist * sin(angle);
-    SDL_SetRenderDrawColor(renderer, 255,255,255,255);
-    SDL_RenderDrawLine(renderer, mx-5, my, mx+5, my);
-    SDL_RenderDrawLine(renderer, mx, my-5, mx, my+5);
+    int pickerY = hueY + hueH + 10;
+    if (y >= pickerY && y <= pickerY + pickerSize && x >= contentX && x <= contentX + pickerSize) {
+        currentSat = (float)(x - contentX) / pickerSize;
+        currentVal = 1.0f - (float)(y - pickerY) / pickerSize;
+        currentSat = std::max(0.0f, std::min(1.0f, currentSat));
+        currentVal = std::max(0.0f, std::min(1.0f, currentVal));
+        Uint8 r, g, b;
+        hsvToRgb(currentHue, currentSat, currentVal, r, g, b);
+        canvas.setColor(r, g, b);
+        return true;
+    }
 
-    int sliderY = panelY + (1.0f - currentVal) * wheelSize;
-    SDL_SetRenderDrawColor(renderer, 0,0,0,255);
-    SDL_RenderDrawLine(renderer, sliderX-5, sliderY, sliderX+sliderW+5, sliderY);
+    int previewY = pickerY + pickerSize + 10;
+    int btnW = 100, btnH = 40;
+    int btnY = previewY + 35;
+    int cancelX = panelX + MARGIN;
+    int okX = panelX + panelW - MARGIN - btnW;
 
-    Uint8 pr, pg, pb;
-    hsvToRgb(currentHue, currentSat, currentVal, pr, pg, pb);
-    SDL_Rect preview = {sliderX + sliderW + 10, panelY + wheelSize - 50, previewW, 40};
-    SDL_SetRenderDrawColor(renderer, pr, pg, pb, 255);
-    SDL_RenderFillRect(renderer, &preview);
-    SDL_SetRenderDrawColor(renderer, 44,44,46,255);
-    SDL_RenderDrawRect(renderer, &preview);
+    if (x >= cancelX && x <= cancelX + btnW && y >= btnY && y <= btnY + btnH) {
+        showOverlay = false;
+        return true;
+    }
 
-    int btnW = 100, btnH = 48;
-    int btnX = (width - btnW) / 2;
-    int btnY = panelY + wheelSize + 20;
-    SDL_SetRenderDrawColor(renderer, 232,232,236,255);
-    SDL_Rect closeBtn = {btnX, btnY, btnW, btnH};
-    SDL_RenderFillRect(renderer, &closeBtn);
-    SDL_SetRenderDrawColor(renderer, 180,180,185,255);
-    SDL_RenderDrawRect(renderer, &closeBtn);
-    renderText(renderer, fontSmall, "Close", {44,44,46,255}, btnX+30, btnY+12);
+    if (x >= okX && x <= okX + btnW && y >= btnY && y <= btnY + btnH) {
+        showOverlay = false;
+        return true;
+    }
+
+    return false;
 }
 
 // ---------- file list helpers ----------
@@ -1509,28 +1557,29 @@ void PiPaint::run() {
     Uint32 lastRender = SDL_GetTicks();
 
     while (true) {
-        std::vector<SDL_Event> touchEvents;
-        touch.processEvents(touchEvents);
-        for (auto& ev : touchEvents) {
-            if (ev.type == SDL_FINGERDOWN) {
-                int x = (int)(ev.tfinger.x * width);
-                int y = (int)(ev.tfinger.y * height);
-                if (ev.tfinger.pressure > 0.0f && ev.tfinger.pressure != 0.5f) {
-                    int pressureSize = std::max(1, (int)(ev.tfinger.pressure * penSize * 2.0f));
+        while (touch.pollTouchEvent(e)) {
+            if (e.type == SDL_FINGERDOWN) {
+                int x = (int)(e.tfinger.x * width);
+                int y = (int)(e.tfinger.y * height);
+                canvas.setPressure(e.tfinger.pressure);
+                if (e.tfinger.pressure > 0.0f && e.tfinger.pressure != 0.5f) {
+                    int pressureSize = std::max(1, (int)(e.tfinger.pressure * penSize * 2.0f));
                     canvas.setSize(std::min(pressureSize, 50));
                 }
-                handleTouchDown(ev.tfinger.fingerId, x, y);
-            } else if (ev.type == SDL_FINGERMOTION) {
-                int x = (int)(ev.tfinger.x * width);
-                int y = (int)(ev.tfinger.y * height);
-                if (ev.tfinger.pressure > 0.0f && ev.tfinger.pressure != 0.5f) {
-                    int pressureSize = std::max(1, (int)(ev.tfinger.pressure * penSize * 2.0f));
+                handleTouchDown(e.tfinger.fingerId, x, y);
+            } else if (e.type == SDL_FINGERMOTION) {
+                int x = (int)(e.tfinger.x * width);
+                int y = (int)(e.tfinger.y * height);
+                canvas.setPressure(e.tfinger.pressure);
+                if (e.tfinger.pressure > 0.0f && e.tfinger.pressure != 0.5f) {
+                    int pressureSize = std::max(1, (int)(e.tfinger.pressure * penSize * 2.0f));
                     canvas.setSize(std::min(pressureSize, 50));
                 }
-                handleTouchMove(ev.tfinger.fingerId, x, y);
-            } else if (ev.type == SDL_FINGERUP) {
+                handleTouchMove(e.tfinger.fingerId, x, y);
+            } else if (e.type == SDL_FINGERUP) {
                 canvas.setSize(penSize);
-                handleTouchUp(ev.tfinger.fingerId);
+                canvas.setPressure(1.0f);
+                handleTouchUp(e.tfinger.fingerId);
             }
         }
 

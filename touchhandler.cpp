@@ -8,6 +8,7 @@
 #include <iostream>
 #include <dirent.h>
 #include <cstring>
+#include <chrono>
 
 static std::string findTouchDevice() {
     DIR* dir = opendir("/dev/input");
@@ -44,9 +45,14 @@ TouchHandler::TouchHandler(int w, int h) : screenW(w), screenH(h) {
     pressureMax = 255;
     dev = nullptr;
     fd = -1;
+
+    for (int i = 0; i < TOUCH_QUEUE_SIZE; i++) {
+        touchQueue[i].valid = false;
+    }
 }
 
 TouchHandler::~TouchHandler() {
+    stopInputThread();
     if (dev) libevdev_free(dev);
     if (fd != -1) close(fd);
 }
@@ -78,17 +84,56 @@ bool TouchHandler::init() {
     return true;
 }
 
-void TouchHandler::processEvents(std::vector<SDL_Event>& events) {
+void TouchHandler::enqueueTouchEvent(int type, int fingerId, int x, int y, float pressure) {
+    int nextWrite = (queueWrite.load() + 1) % TOUCH_QUEUE_SIZE;
+    int currentRead = queueRead.load();
+
+    if (nextWrite == currentRead) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(queueMutex);
+    touchQueue[nextWrite] = {type, fingerId, x, y, pressure, true};
+    queueWrite.store(nextWrite);
+}
+
+bool TouchHandler::pollTouchEvent(SDL_Event& out) {
+    if (queueRead.load() == queueWrite.load()) {
+        return false;
+    }
+
+    int nextRead = (queueRead.load() + 1) % TOUCH_QUEUE_SIZE;
+    
+    std::lock_guard<std::mutex> lock(queueMutex);
+    if (!touchQueue[nextRead].valid) {
+        return false;
+    }
+
+    const TouchEvent& ev = touchQueue[nextRead];
+    out.type = ev.type;
+    out.tfinger.fingerId = ev.fingerId;
+    out.tfinger.x = ev.x / (float)screenW;
+    out.tfinger.y = ev.y / (float)screenH;
+    out.tfinger.dx = 0;
+    out.tfinger.dy = 0;
+    out.tfinger.pressure = ev.pressure;
+
+    touchQueue[nextRead].valid = false;
+    queueRead.store(nextRead);
+
+    return true;
+}
+
+void TouchHandler::processEvents() {
     if (!dev) return;
 
     fd_set fds;
     FD_ZERO(&fds);
     FD_SET(fd, &fds);
-    struct timeval tv = {0, 0};
+    struct timeval tv = {0, 1000};
     if (select(fd + 1, &fds, nullptr, nullptr, &tv) <= 0) return;
 
     struct input_event ev;
-    // Staging area: tracking ID -> staged data
     struct StagedSlot {
         int x, y;
         float pressure;
@@ -97,7 +142,6 @@ void TouchHandler::processEvents(std::vector<SDL_Event>& events) {
     };
     std::map<int, StagedSlot> staged;
 
-    // Copy existing states into staged as base
     for (auto& [tid, state] : currentStates) {
         staged[tid] = {state.x, state.y, state.pressure, true, false};
     }
@@ -118,24 +162,21 @@ void TouchHandler::processEvents(std::vector<SDL_Event>& events) {
             }
             else if (ev.code == ABS_MT_TRACKING_ID) {
                 if (ev.value == -1) {
-                    // Finger lifted: remove from mapping and generate UP event
                     auto it = slotToTrackingId.find(currentSlot);
                     if (it != slotToTrackingId.end()) {
                         int trackingId = it->second;
                         auto stateIt = currentStates.find(trackingId);
                         if (stateIt != currentStates.end()) {
-                            generateTouchEvent(SDL_FINGERUP, trackingId,
+                            enqueueTouchEvent(SDL_FINGERUP, trackingId,
                                                stateIt->second.x, stateIt->second.y,
-                                               stateIt->second.pressure, events);
+                                               stateIt->second.pressure);
                             currentStates.erase(stateIt);
                         }
                         slotToTrackingId.erase(it);
                         staged.erase(trackingId);
                     }
                 } else {
-                    // New finger: store mapping slot -> tracking ID
                     slotToTrackingId[currentSlot] = ev.value;
-                    // Initialize staged entry for this tracking ID
                     staged[ev.value] = {0, 0, 0.5f, false, false};
                 }
             }
@@ -171,7 +212,6 @@ void TouchHandler::processEvents(std::vector<SDL_Event>& events) {
             }
         }
         else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
-            // Commit all staged changes
             for (auto& [tid, ss] : staged) {
                 int x = ss.x, y = ss.y;
                 applyCalibration(x, y);
@@ -179,19 +219,39 @@ void TouchHandler::processEvents(std::vector<SDL_Event>& events) {
                 bool known = currentStates.count(tid) > 0;
 
                 if (!known && ss.hasPos) {
-                    // New touch: generate DOWN event
-                    generateTouchEvent(SDL_FINGERDOWN, tid, x, y, pressure, events);
+                    enqueueTouchEvent(SDL_FINGERDOWN, tid, x, y, pressure);
                     currentStates[tid] = {x, y, pressure};
                 } else if (known && ss.moved) {
-                    // Existing touch moved: generate MOTION event
-                    generateTouchEvent(SDL_FINGERMOTION, tid, x, y, pressure, events);
+                    enqueueTouchEvent(SDL_FINGERMOTION, tid, x, y, pressure);
                     currentStates[tid] = {x, y, pressure};
                 }
             }
-            // Reset moved flag for next cycle
             for (auto& [tid, ss] : staged) ss.moved = false;
         }
     }
+}
+
+void TouchHandler::startInputThread() {
+    if (inputThread) return;
+    inputThreadRunning.store(true);
+    inputThread = new std::thread([this]() {
+        std::cout << "Touch input thread started" << std::endl;
+        while (inputThreadRunning.load()) {
+            processEvents();
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+        }
+        std::cout << "Touch input thread stopped" << std::endl;
+    });
+}
+
+void TouchHandler::stopInputThread() {
+    if (!inputThread) return;
+    inputThreadRunning.store(false);
+    if (inputThread->joinable()) {
+        inputThread->join();
+    }
+    delete inputThread;
+    inputThread = nullptr;
 }
 
 void TouchHandler::applyCalibration(int& x, int& y) {
@@ -199,18 +259,6 @@ void TouchHandler::applyCalibration(int& x, int& y) {
     y += calibrationY;
     x = std::max(0, std::min(screenW - 1, x));
     y = std::max(0, std::min(screenH - 1, y));
-}
-
-void TouchHandler::generateTouchEvent(int type, int fingerId, int x, int y, float pressure, std::vector<SDL_Event>& events) {
-    SDL_Event e;
-    e.type = type;
-    e.tfinger.fingerId = fingerId;
-    e.tfinger.x = x / (float)screenW;
-    e.tfinger.y = y / (float)screenH;
-    e.tfinger.dx = 0;
-    e.tfinger.dy = 0;
-    e.tfinger.pressure = pressure;
-    events.push_back(e);
 }
 
 void TouchHandler::setCalibration(int xOffset, int yOffset) {

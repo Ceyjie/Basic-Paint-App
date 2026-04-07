@@ -1,2 +1,5 @@
 #!/bin/bash
-g++ -std=c++11 -o pipaint drawingcanvas.cpp touchhandler.cpp main.cpp `sdl2-config --cflags --libs` -lSDL2_image -lSDL2_ttf -levdev
+g++ -std=c++17 -O2 -I/usr/include/libevdev-1.0 -o pipaint \
+    drawingcanvas.cpp touchhandler.cpp main.cpp \
+    $(pkg-config --cflags --libs sdl2) \
+    -lSDL2_image -lSDL2_ttf -levdev -lpthread

@@ -5,7 +5,7 @@
 #include <algorithm>
 #include <cmath>
 
-DrawingCanvas::DrawingCanvas(int w, int h) : width(w), height(h) {
+DrawingCanvas::DrawingCanvas(int w, int h) : width(w), height(h), dirtyRect{-1, 0, 0, 0} {
     canvas = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
     background = nullptr;
     currentColor = SDL_MapRGB(canvas->format, 0, 0, 0);
@@ -13,12 +13,18 @@ DrawingCanvas::DrawingCanvas(int w, int h) : width(w), height(h) {
     penSize = 5;
     minSize = 1;
     maxSize = 50;
+    currentPressure = 1.0f;
     eraserMode = false;
     fillMode = false;
 
-    // Make canvas transparent
     SDL_FillRect(canvas, nullptr, SDL_MapRGBA(canvas->format, 0,0,0,0));
     pushState();
+
+    for (int i = 0; i < 10; i++) {
+        strokeBuffers[i].points.reserve(500);
+        strokeBuffers[i].smoothedPoints.reserve(500 * SMOOTHING_SEGMENTS);
+        strokeBuffers[i].needsFlush = false;
+    }
 }
 
 DrawingCanvas::~DrawingCanvas() {
@@ -29,20 +35,18 @@ DrawingCanvas::~DrawingCanvas() {
 }
 
 void DrawingCanvas::clear() {
-    // Clear drawing layer to transparent
+    dirtyRect = {-1, 0, 0, 0};
     SDL_FillRect(canvas, nullptr, SDL_MapRGBA(canvas->format, 0,0,0,0));
     pushState();
 }
 
 void DrawingCanvas::resetToBlank() {
-    // Clear drawing layer to transparent
+    dirtyRect = {-1, 0, 0, 0};
     SDL_FillRect(canvas, nullptr, SDL_MapRGBA(canvas->format, 0,0,0,0));
-    // Discard background
     if (background) {
         SDL_FreeSurface(background);
         background = nullptr;
     }
-    // Reset undo/redo
     for (auto s : undoStack) SDL_FreeSurface(s);
     for (auto s : redoStack) SDL_FreeSurface(s);
     undoStack.clear();
@@ -60,6 +64,10 @@ void DrawingCanvas::setSize(int size) {
     penSize = std::max(minSize, std::min(maxSize, size));
 }
 
+void DrawingCanvas::setPressure(float pressure) {
+    currentPressure = std::max(0.1f, std::min(1.0f, pressure));
+}
+
 void DrawingCanvas::toggleEraser() {
     eraserMode = !eraserMode;
     fillMode = false;
@@ -71,18 +79,15 @@ void DrawingCanvas::toggleFill() {
 }
 
 void DrawingCanvas::toggleBackground() {
-    // This toggles the background color of the drawing layer only
-    // (does not affect loaded background image)
+    dirtyRect = {-1, 0, 0, 0};
     Uint32 oldBg = backgroundColor;
     backgroundColor = (oldBg == SDL_MapRGB(canvas->format, 255,255,255)) ?
                        SDL_MapRGB(canvas->format, 0,0,0) :
                        SDL_MapRGB(canvas->format, 255,255,255);
-    // Invert all non‑transparent pixels on the drawing layer
     Uint32* pixels = (Uint32*)canvas->pixels;
     int totalPixels = width * height;
     for (int i = 0; i < totalPixels; i++) {
         Uint32 pix = pixels[i];
-        // Ignore transparent pixels (alpha 0)
         if ((pix >> 24) == 0) continue;
         if (pix == oldBg) {
             pixels[i] = backgroundColor;
@@ -96,33 +101,111 @@ void DrawingCanvas::toggleBackground() {
     pushState();
 }
 
+void DrawingCanvas::expandDirty(int x, int y, int margin) {
+    dirtyRect = {-1, 0, 0, 0};
+}
+
+void DrawingCanvas::catmullRomSpline(const SDL_Point& p0, const SDL_Point& p1,
+                                      const SDL_Point& p2, const SDL_Point& p3,
+                                      std::vector<SDL_Point>& output, int segments) {
+    for (int i = 1; i <= segments; i++) {
+        float t = i / (float)segments;
+        float t2 = t * t;
+        float t3 = t2 * t;
+
+        float x = 0.5f * ((2.0f * p1.x) +
+                         (-p0.x + p2.x) * t +
+                         (2.0f * p0.x - 5.0f * p1.x + 4.0f * p2.x - p3.x) * t2 +
+                         (-p0.x + 3.0f * p1.x - 3.0f * p2.x + p3.x) * t3);
+        float y = 0.5f * ((2.0f * p1.y) +
+                         (-p0.y + p2.y) * t +
+                         (2.0f * p0.y - 5.0f * p1.y + 4.0f * p2.y - p3.y) * t2 +
+                         (-p0.y + 3.0f * p1.y - 3.0f * p2.y + p3.y) * t3);
+        output.push_back({(int)x, (int)y});
+    }
+}
+
+void DrawingCanvas::drawSmoothLine(const std::vector<SDL_Point>& points) {
+    if (points.size() < 2) return;
+    for (size_t i = 1; i < points.size(); i++) {
+        drawThickLine(points[i-1].x, points[i-1].y, points[i].x, points[i].y);
+    }
+}
+
 void DrawingCanvas::startStroke(int x, int y, int fingerId) {
     if (fillMode) {
         floodFill(x, y);
         fillMode = false;
         return;
     }
-    activeStrokes.erase(fingerId);
+
+    StrokeBuffer& buf = strokeBuffers[fingerId];
+    buf.points.clear();
+    buf.smoothedPoints.clear();
+    buf.points.push_back({{x, y}, currentPressure});
+    buf.lastDrawn = {x, y};
+    buf.needsFlush = false;
+
     activeStrokes[fingerId] = {x, y};
     drawPoint(x, y);
 }
 
 void DrawingCanvas::continueStroke(int x, int y, int fingerId) {
-    auto it = activeStrokes.find(fingerId);
-    if (it == activeStrokes.end()) return;
-    drawThickLine(it->second.x, it->second.y, x, y);
-    it->second = {x, y};
+    StrokeBuffer& buf = strokeBuffers[fingerId];
+    if (buf.points.empty()) {
+        startStroke(x, y, fingerId);
+        return;
+    }
+
+    SDL_Point prev = buf.points.back().pos;
+    buf.points.push_back({{x, y}, currentPressure});
+
+    if ((int)buf.points.size() >= SMOOTHING_MIN_POINTS) {
+        std::vector<SDL_Point> segment;
+        int i = buf.points.size() - 1;
+
+        if (i >= 3) {
+            auto& p0 = buf.points[i - 3].pos;
+            auto& p1 = buf.points[i - 2].pos;
+            auto& p2 = buf.points[i - 1].pos;
+            auto& p3 = buf.points[i].pos;
+            catmullRomSpline(p0, p1, p2, p3, segment, SMOOTHING_SEGMENTS);
+            if (!segment.empty()) {
+                drawThickLine(prev.x, prev.y, segment.front().x, segment.front().y);
+                drawSmoothLine(segment);
+                buf.lastDrawn = segment.back();
+            }
+        } else {
+            drawThickLine(prev.x, prev.y, x, y);
+            buf.lastDrawn = {x, y};
+        }
+    } else {
+        drawThickLine(prev.x, prev.y, x, y);
+        buf.lastDrawn = {x, y};
+    }
+
+    activeStrokes[fingerId] = {x, y};
 }
 
 void DrawingCanvas::endStroke(int fingerId) {
+    strokeBuffers[fingerId].points.clear();
+    strokeBuffers[fingerId].smoothedPoints.clear();
+
     if (activeStrokes.erase(fingerId) > 0) {
         pushState();
+        dirtyRect = {-1, 0, 0, 0};
     }
 }
 
 void DrawingCanvas::drawPoint(int x, int y) {
+    int effectiveSize = penSize;
+    if (currentPressure > 0.1f && currentPressure < 1.0f) {
+        effectiveSize = (int)(penSize * currentPressure * 1.5f);
+        effectiveSize = std::max(1, effectiveSize);
+    }
     Uint32 color = eraserMode ? SDL_MapRGBA(canvas->format, 0,0,0,0) : currentColor;
-    drawCircleAA(x, y, penSize, color);
+    drawCircleAA(x, y, effectiveSize, color);
+    expandDirty(x, y, effectiveSize + 2);
 }
 
 void DrawingCanvas::drawCircle(int cx, int cy, int radius, Uint32 color) {
@@ -157,7 +240,6 @@ void DrawingCanvas::blendPixel(int x, int y, Uint32 color, float alpha) {
     Uint8 db =  *px        & 0xFF;
     Uint8 da = (*px >> 24) & 0xFF;
 
-    // Alpha blend (over operation)
     float a = sa * alpha;
     float inv_a = 1.0f - a;
     Uint8 r = (Uint8)(sr * a + dr * inv_a);
@@ -183,16 +265,13 @@ void DrawingCanvas::drawCircleAA(int cx, int cy, int radius, Uint32 color) {
         int x0 = (int)(cx - halfW);
         int x1 = (int)(cx + halfW);
 
-        // Solid interior
         for (int x = std::max(0, x0); x <= std::min(width-1, x1); x++)
             setPixel(x, y, color, canvas);
 
-        // Left fringe
         float leftFrac = (cx - halfW) - (float)x0;
         if (leftFrac > 0.0f)
             blendPixel(x0 - 1, y, color, leftFrac);
 
-        // Right fringe
         float rightFrac = (float)(x1 + 1) - (cx + halfW);
         if (rightFrac > 0.0f)
             blendPixel(x1 + 1, y, color, rightFrac);
@@ -214,36 +293,57 @@ void DrawingCanvas::drawThickLine(int x1, int y1, int x2, int y2) {
 
 void DrawingCanvas::floodFill(int x, int y) {
     if (x < 0 || x >= width || y < 0 || y >= height) return;
-    // Flood fill works only on drawing layer
     Uint32 target = getPixel(x, y, canvas);
     Uint32 fill = eraserMode ? SDL_MapRGBA(canvas->format, 0,0,0,0) : currentColor;
     if (target == fill) return;
 
     pushState();
+    dirtyRect = {-1, 0, 0, 0};
 
-    std::queue<SDL_Point> queue;
-    queue.push({x, y});
-    std::vector<std::vector<bool>> visited(width, std::vector<bool>(height, false));
-    visited[x][y] = true;
+    static std::vector<uint8_t> visited;
+    int totalSize = width * height;
+    if ((int)visited.size() < totalSize) {
+        visited.resize(totalSize);
+    }
+    std::fill(visited.begin(), visited.begin() + totalSize, 0);
 
-    while (!queue.empty()) {
-        SDL_Point p = queue.front(); queue.pop();
-        setPixel(p.x, p.y, fill, canvas);
+    int minX = x, maxX = x, minY = y, maxY = y;
 
-        for (int dx = -1; dx <= 1; dx++) {
-            for (int dy = -1; dy <= 1; dy++) {
-                if (dx == 0 && dy == 0) continue;
-                if (dx != 0 && dy != 0) continue;
-                int nx = p.x + dx, ny = p.y + dy;
-                if (nx >= 0 && nx < width && ny >= 0 && ny < height && !visited[nx][ny]) {
-                    if (getPixel(nx, ny, canvas) == target) {
-                        visited[nx][ny] = true;
-                        queue.push({nx, ny});
-                    }
-                }
-            }
+    std::queue<int> q;
+    int startIdx = y * width + x;
+    q.push(startIdx);
+    visited[startIdx] = 1;
+
+    while (!q.empty()) {
+        int idx = q.front();
+        q.pop();
+        int px = idx % width;
+        int py = idx / width;
+        setPixel(px, py, fill, canvas);
+        minX = std::min(minX, px);
+        maxX = std::max(maxX, px);
+        minY = std::min(minY, py);
+        maxY = std::max(maxY, py);
+
+        if (px > 0 && !visited[idx - 1] && getPixel(px - 1, py, canvas) == target) {
+            visited[idx - 1] = 1;
+            q.push(idx - 1);
+        }
+        if (px < width - 1 && !visited[idx + 1] && getPixel(px + 1, py, canvas) == target) {
+            visited[idx + 1] = 1;
+            q.push(idx + 1);
+        }
+        if (py > 0 && !visited[idx - width] && getPixel(px, py - 1, canvas) == target) {
+            visited[idx - width] = 1;
+            q.push(idx - width);
+        }
+        if (py < height - 1 && !visited[idx + width] && getPixel(px, py + 1, canvas) == target) {
+            visited[idx + width] = 1;
+            q.push(idx + width);
         }
     }
+
+    expandDirty((minX + maxX) / 2, (minY + maxY) / 2, std::max(maxX - minX, maxY - minY) + 5);
 }
 
 void DrawingCanvas::drawShapeLine(int x1, int y1, int x2, int y2) {
@@ -284,6 +384,7 @@ void DrawingCanvas::undo() {
         redoStack.push_front(undoStack.front());
         undoStack.pop_front();
         restoreState(undoStack.front());
+        dirtyRect = {-1, 0, 0, 0};
     }
 }
 
@@ -292,21 +393,19 @@ void DrawingCanvas::redo() {
         undoStack.push_front(redoStack.front());
         redoStack.pop_front();
         restoreState(undoStack.front());
+        dirtyRect = {-1, 0, 0, 0};
     }
 }
 
 bool DrawingCanvas::save(const std::string& filename) {
-    // Composite background and drawing layer
     SDL_Surface* composite = SDL_CreateRGBSurfaceWithFormat(0, width, height, 32, SDL_PIXELFORMAT_ARGB8888);
     if (!composite) return false;
 
-    // Fill composite with background color if no background image
     if (background) {
         SDL_BlitSurface(background, nullptr, composite, nullptr);
     } else {
         SDL_FillRect(composite, nullptr, backgroundColor);
     }
-    // Blend drawing layer over composite
     SDL_BlitSurface(canvas, nullptr, composite, nullptr);
 
     bool result = IMG_SavePNG(composite, filename.c_str()) == 0;
@@ -318,7 +417,6 @@ bool DrawingCanvas::load(const std::string& filename) {
     SDL_Surface* img = IMG_Load(filename.c_str());
     if (!img) return false;
 
-    // Scale to canvas size
     SDL_Surface* scaled = SDL_CreateRGBSurfaceWithFormat(0, width, height, 32, SDL_PIXELFORMAT_ARGB8888);
     if (!scaled) {
         SDL_FreeSurface(img);
@@ -327,14 +425,11 @@ bool DrawingCanvas::load(const std::string& filename) {
     SDL_BlitScaled(img, nullptr, scaled, nullptr);
     SDL_FreeSurface(img);
 
-    // Replace background (discard old)
     if (background) SDL_FreeSurface(background);
     background = scaled;
 
-    // Clear drawing layer to transparent
     SDL_FillRect(canvas, nullptr, SDL_MapRGBA(canvas->format, 0,0,0,0));
 
-    // Reset undo/redo history
     for (auto s : undoStack) SDL_FreeSurface(s);
     for (auto s : redoStack) SDL_FreeSurface(s);
     undoStack.clear();
@@ -345,14 +440,33 @@ bool DrawingCanvas::load(const std::string& filename) {
 }
 
 void DrawingCanvas::compositeToSurface(SDL_Surface* target) {
-    // Fill target with background (or background color if no background)
+    if (dirtyRect.x < 0) {
+        if (background) {
+            SDL_BlitSurface(background, nullptr, target, nullptr);
+        } else {
+            SDL_FillRect(target, nullptr, backgroundColor);
+        }
+        SDL_BlitSurface(canvas, nullptr, target, nullptr);
+    } else {
+        if (background) {
+            SDL_BlitSurface(background, nullptr, target, nullptr);
+        }
+        SDL_BlitSurface(canvas, nullptr, target, &dirtyRect);
+    }
+}
+
+void DrawingCanvas::compositeDirtyRect(SDL_Surface* target, const SDL_Rect& clip) {
     if (background) {
         SDL_BlitSurface(background, nullptr, target, nullptr);
-    } else {
-        SDL_FillRect(target, nullptr, backgroundColor);
     }
-    // Overlay drawing layer
-    SDL_BlitSurface(canvas, nullptr, target, nullptr);
+    if (dirtyRect.x >= 0) {
+        SDL_Rect updateRect = dirtyRect;
+        if (SDL_IntersectRect(&dirtyRect, &clip, &updateRect)) {
+            SDL_BlitSurface(canvas, &updateRect, target, &updateRect);
+        }
+    } else {
+        SDL_BlitSurface(canvas, nullptr, target, nullptr);
+    }
 }
 
 Uint32 DrawingCanvas::getPixel(int x, int y, SDL_Surface* surf) {
@@ -362,12 +476,9 @@ Uint32 DrawingCanvas::getPixel(int x, int y, SDL_Surface* surf) {
 
 Uint32 DrawingCanvas::getPixelAt(int x, int y) {
     if (x < 0 || x >= width || y < 0 || y >= height) return 0;
-    // Return composite pixel (background + drawing)
     if (background) {
         Uint32 bg = getPixel(x, y, background);
         Uint32 fg = getPixel(x, y, canvas);
-        // Simple blend: if fg has alpha, we need to composite
-        // For simplicity, just return fg if opaque, else bg
         if ((fg >> 24) == 0) return bg;
         return fg;
     } else {

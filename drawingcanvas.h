@@ -12,13 +12,14 @@ public:
     DrawingCanvas(int width, int height);
     ~DrawingCanvas();
 
-    void clear();                     // clears drawing layer only
-    void resetToBlank();              // discards both layers and history
+    void clear();
+    void resetToBlank();
     void setColor(Uint8 r, Uint8 g, Uint8 b);
     void setSize(int size);
+    void setPressure(float pressure);
     void toggleEraser();
     void toggleFill();
-    void toggleBackground();          // toggles background color of drawing layer
+    void toggleBackground();
     void startStroke(int x, int y, int fingerId);
     void continueStroke(int x, int y, int fingerId);
     void endStroke(int fingerId);
@@ -31,32 +32,60 @@ public:
     bool save(const std::string& filename);
     bool load(const std::string& filename);
 
-    // Composite the background and drawing layer for rendering
     void compositeToSurface(SDL_Surface* target);
-
-    // Get the drawing layer (canvas) for editing
+    void compositeDirtyRect(SDL_Surface* target, const SDL_Rect& dirty);
     SDL_Surface* getCanvas() const { return canvas; }
+
+    bool needsFullUpdate() const { return dirtyRect.x < 0; }
+    SDL_Rect getDirtyRect() const { return dirtyRect; }
+    void clearDirtyRect() { dirtyRect = {-1, 0, 0, 0}; }
+    void invalidateFull() { dirtyRect = {-1, 0, 0, 0}; }
 
     int getPenSize() const { return penSize; }
     bool isEraserMode() const { return eraserMode; }
     bool isFillMode() const { return fillMode; }
     Uint32 getCurrentColor() const { return currentColor; }
-    Uint32 getPixelAt(int x, int y);  // returns pixel from composite (background + canvas)
+    Uint32 getPixelAt(int x, int y);
 
 private:
+    static const int SMOOTHING_MIN_POINTS = 3;
+    static const int SMOOTHING_SEGMENTS = 8;
+
+    struct StrokePoint {
+        SDL_Point pos;
+        float pressure;
+    };
+
+    struct StrokeBuffer {
+        std::vector<StrokePoint> points;
+        std::vector<SDL_Point> smoothedPoints;
+        SDL_Point lastDrawn;
+        bool needsFlush;
+    };
+
     int width, height;
-    SDL_Surface* canvas;        // drawing layer (transparent background)
-    SDL_Surface* background;    // loaded image (protected)
+    SDL_Surface* canvas;
+    SDL_Surface* background;
     Uint32 currentColor;
-    Uint32 backgroundColor;     // used for eraser and clear (applies to canvas)
+    Uint32 backgroundColor;
     int penSize;
     int minSize, maxSize;
+    float currentPressure;
     bool eraserMode, fillMode;
     std::map<int, SDL_Point> activeStrokes;
+    std::map<int, StrokeBuffer> strokeBuffers;
     std::deque<SDL_Surface*> undoStack;
     std::deque<SDL_Surface*> redoStack;
     int maxUndo = 20;
 
+    SDL_Rect dirtyRect;
+    static constexpr int DIRTY_MARGIN = 50;
+
+    void expandDirty(int x, int y, int margin = DIRTY_MARGIN);
+    void catmullRomSpline(const SDL_Point& p0, const SDL_Point& p1,
+                          const SDL_Point& p2, const SDL_Point& p3,
+                          std::vector<SDL_Point>& output, int segments);
+    void drawSmoothLine(const std::vector<SDL_Point>& points);
     void drawPoint(int x, int y);
     void drawCircle(int cx, int cy, int radius, Uint32 color);
     void drawCircleAA(int cx, int cy, int radius, Uint32 color);
